@@ -1,0 +1,1 @@
+vault-core: Es el núcleo principal. Aquí vive el 100% de la lógica de negocio pura: el cifrado (AES-256 / Argon2id), el manejo de la base de datos local (SQLCipher), el generador de contraseñas, las notas y el motor de sincronización. No sabe nada de interfaces gráficas; solo procesa datos de forma segura.
