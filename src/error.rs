@@ -21,6 +21,12 @@ pub enum Error {
     /// The OS random number generator failed.
     #[error("random number generation failed")]
     Rng,
+    /// The referenced record does not exist (or is deleted).
+    #[error("record not found")]
+    NotFound,
+    /// Input violates an invariant (empty name, unknown type, duplicate id, ...).
+    #[error("invalid input")]
+    InvalidInput,
     /// Database failure (details withheld to avoid leaking data).
     #[error("database error")]
     Database,
