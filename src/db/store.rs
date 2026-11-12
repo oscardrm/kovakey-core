@@ -20,11 +20,11 @@ use std::fmt;
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use zeroize::{Zeroize, Zeroizing};
 
-use super::snapshot::sha256_hex;
 use super::{db_err, Database};
 use crate::error::{Error, Result};
 use crate::models::{BlockKind, Category, HistoryEntry, ItemType, NoteBlock, Tag};
 use crate::notes::detect_language;
+use crate::side_blob::sha256_hex;
 use crate::tagger::suggest_tags;
 
 /// Time and writer identity for a write. Injected so core stays free of wall-clock access.

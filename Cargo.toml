@@ -26,6 +26,9 @@ data-encoding = "2"
 hmac = "0.12"
 sha1 = "0.10"
 uuid = { version = "1", features = ["v7"] }
+# Snapshot wire format (ADR 0001): compact, deterministic, no_std-friendly, wasm-safe.
+serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
+postcard = { version = "1", default-features = false, features = ["alloc"] }
 rusqlite = { version = "0.32", features = ["bundled-sqlcipher-vendored-openssl"], optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]

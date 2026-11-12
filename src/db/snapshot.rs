@@ -11,8 +11,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::side_blob::sha256_hex;
 use rusqlite::{params, Connection, TransactionBehavior};
-use sha2::{Digest, Sha256};
 
 use super::{db_err, Database};
 use crate::error::{Error, Result};
@@ -215,10 +215,6 @@ fn read_all(conn: &Connection) -> Result<Snapshot> {
         note_blocks,
         note_images,
     })
-}
-
-pub(super) fn sha256_hex(data: &[u8]) -> String {
-    data_encoding::HEXLOWER.encode(&Sha256::digest(data))
 }
 
 /// Write `snap` using upserts. Must run inside a transaction.
