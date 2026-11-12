@@ -8,9 +8,9 @@
 mod snapshot;
 mod store;
 
-pub use store::{
+pub use crate::ops::{
     BlockInput, CategoryUpdate, FieldInput, FieldView, ItemDetail, ItemSummary, ItemUpdate,
-    NewCategory, NewItem, WriteCtx,
+    NewCategory, NewItem, VaultStore, WriteCtx,
 };
 
 use std::path::Path;

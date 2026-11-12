@@ -7,7 +7,7 @@
 )]
 
 use vault_core::crypto::SecretKey;
-use vault_core::db::{Database, FieldInput, NewItem, WriteCtx};
+use vault_core::db::{Database, FieldInput, NewItem, VaultStore, WriteCtx};
 use vault_core::models::ItemType;
 
 pub fn key() -> SecretKey {
@@ -26,7 +26,13 @@ pub fn ctx(device: &str, now_ms: i64) -> WriteCtx<'_> {
 }
 
 /// Login item with a (fake) password field. Returns `(item_id)`.
-pub fn login(db: &mut Database, device: &str, now: i64, title: &str, password: &str) -> String {
+pub fn login<S: VaultStore>(
+    db: &mut S,
+    device: &str,
+    now: i64,
+    title: &str,
+    password: &str,
+) -> String {
     let mut item = NewItem::new(ItemType::Credential, title);
     item.fields = vec![
         FieldInput::new("username", "text", "user@example.test", false),

@@ -27,6 +27,9 @@ pub enum Error {
     /// Input violates an invariant (empty name, unknown type, duplicate id, ...).
     #[error("invalid input")]
     InvalidInput,
+    /// The session is locked: keys and data have been wiped.
+    #[error("vault is locked")]
+    Locked,
     /// Database failure (details withheld to avoid leaking data).
     #[error("database error")]
     Database,

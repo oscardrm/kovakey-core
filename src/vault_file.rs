@@ -78,6 +78,26 @@ pub fn seal_vault(
     Ok(SealedVault { file, side_blobs })
 }
 
+/// Storage names of the side blobs a `.vault` file refers to (deduplicated, sorted), so a sync
+/// client can download exactly those before [`open_vault`]. Same errors as [`open_vault`]
+/// except that missing blobs are not an error here.
+pub fn required_side_blobs(file: &[u8], keys: &VaultKeys) -> Result<Vec<String>> {
+    let (header_bytes, rest) = file.split_at_checked(HEADER_LEN).ok_or(Error::Corrupted)?;
+    VaultHeader::from_bytes(header_bytes)?;
+    let (version, sealed) = rest.split_first().ok_or(Error::Corrupted)?;
+    if !codec::is_supported_version(*version) {
+        return Err(Error::UnsupportedVersion);
+    }
+    let key = keys.data_key().derive_subkey(PAYLOAD_LABEL)?;
+    let payload: Zeroizing<Vec<u8>> =
+        crypto::open(&key, sealed, &payload_aad(header_bytes, *version))?;
+    let names: std::collections::BTreeSet<String> = codec::external_image_refs(*version, &payload)?
+        .iter()
+        .map(|(sha, _)| side_blob::blob_name(keys, sha))
+        .collect::<Result<_>>()?;
+    Ok(names.into_iter().collect())
+}
+
 /// Decrypt a `.vault` file. `side_blob` looks up sealed side blobs by storage name.
 ///
 /// Errors: wrong key or any tampering of header/payload/side blobs is [`Error::Decryption`];

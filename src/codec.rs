@@ -50,6 +50,15 @@ pub fn decode_snapshot(
     }
 }
 
+/// `(sha256_hex, size)` of every image stored outside the payload (a side blob), so a client can
+/// fetch exactly those blobs before decoding. Unknown versions fail before any parsing.
+pub fn external_image_refs(version: u8, bytes: &[u8]) -> Result<Vec<(String, u64)>> {
+    match version {
+        1 => v1::external_refs(bytes),
+        _ => Err(Error::UnsupportedVersion),
+    }
+}
+
 /// Whether this build can decode `version`.
 pub fn is_supported_version(version: u8) -> bool {
     version == 1
@@ -486,6 +495,20 @@ mod v1 {
             }
             Ok(snap)
         }
+    }
+
+    pub fn external_refs(bytes: &[u8]) -> Result<Vec<(String, u64)>> {
+        let (wire, rest) =
+            postcard::take_from_bytes::<Payload>(bytes).map_err(|_| Error::Corrupted)?;
+        if !rest.is_empty() {
+            return Err(Error::Corrupted);
+        }
+        Ok(wire
+            .images
+            .iter()
+            .filter(|i| i.data.is_none())
+            .map(|i| (HEXLOWER.encode(&i.sha256), i.size))
+            .collect())
     }
 
     pub fn decode(bytes: &[u8], resolve: &mut ImageResolver<'_>) -> Result<Snapshot> {
