@@ -515,7 +515,7 @@ fn seeding_creates_editable_preset_categories_once() {
     let c = card(&d);
     let fields = d.list_category_fields(&c.id).unwrap();
     let core: Vec<_> = fields.iter().filter(|f| f.is_core).map(|f| f.kind.as_str()).collect();
-    assert_eq!(core, ["card_number", "expiry", "cvv"]);
+    assert_eq!(core, ["text", "card_number", "expiry", "cvv"]);
 
     // Fully editable like any category.
     d.update_category(

@@ -981,15 +981,21 @@ impl Database {
     /// Create the preset categories that do not exist yet. Idempotent.
     pub fn seed_default_categories(&mut self, ctx: &WriteCtx<'_>) -> Result<()> {
         let tx = self.begin(ctx)?;
-        let ids: Vec<String> = {
+        let existing: Vec<Category> = {
             let mut stmt = tx.prepare("SELECT id FROM categories").map_err(db_err)?;
-            let rows = stmt
+            let ids = stmt
                 .query_map([], |r| r.get::<_, String>(0))
                 .map_err(db_err)?
                 .collect::<rusqlite::Result<Vec<_>>>()
                 .map_err(db_err)?;
-            rows
+            ids.iter()
+                .map(|id| read_category(&tx, id))
+                .collect::<Result<_>>()?
         };
+        let mut existing_fields = Vec::new();
+        for c in &existing {
+            existing_fields.extend(read_category_fields(&tx, &c.id, true)?);
+        }
         let first: i64 = tx
             .query_row(
                 "SELECT coalesce(max(sort_order)+1,0) FROM categories WHERE deleted_at IS NULL",
@@ -997,8 +1003,7 @@ impl Database {
                 |r| r.get(0),
             )
             .map_err(db_err)?;
-        let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
-        let (cats, fields) = seed_records(ctx, &refs, first);
+        let (cats, fields) = seed_records(ctx, &existing, &existing_fields, first);
         for c in &cats {
             tx.execute(
                 "INSERT INTO categories(id,name,color,icon,icon_color,preset,sort_order,created_at,updated_at,updated_by)
@@ -1113,8 +1118,8 @@ fn write_category_fields(conn: &Connection, fields: &[CategoryField]) -> Result<
             "INSERT INTO category_fields(id,category_id,name,kind,is_secret,is_core,sort_order,updated_at,updated_by,deleted_at)
              VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
              ON CONFLICT(id) DO UPDATE SET name=excluded.name,kind=excluded.kind,
-               is_secret=excluded.is_secret,sort_order=excluded.sort_order,
-               updated_at=excluded.updated_at,updated_by=excluded.updated_by,
+               is_secret=excluded.is_secret,is_core=excluded.is_core,
+               sort_order=excluded.sort_order,updated_at=excluded.updated_at,updated_by=excluded.updated_by,
                deleted_at=excluded.deleted_at",
             params![
                 f.id, f.category_id, f.name, f.kind, f.is_secret, f.is_core, f.sort_order,

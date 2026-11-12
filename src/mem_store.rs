@@ -913,7 +913,6 @@ impl VaultStore for MemStore {
 
     fn seed_default_categories(&mut self, ctx: &WriteCtx<'_>) -> Result<()> {
         self.tx(ctx, |s| {
-            let ids: Vec<&str> = s.categories.iter().map(|c| c.id.as_str()).collect();
             let first = s
                 .categories
                 .iter()
@@ -921,9 +920,9 @@ impl VaultStore for MemStore {
                 .map(|c| c.sort_order.saturating_add(1))
                 .max()
                 .unwrap_or(0);
-            let (cats, fields) = seed_records(ctx, &ids, first);
+            let (cats, fields) = seed_records(ctx, &s.categories, &s.category_fields, first);
             s.categories.extend(cats);
-            s.category_fields.extend(fields);
+            upsert_category_fields(s, fields);
             Ok(())
         })
     }
