@@ -20,12 +20,15 @@ use zeroize::Zeroizing;
 
 use super::{db_err, Database};
 use crate::error::{Error, Result};
-use crate::models::{BlockKind, Category, HistoryEntry, ItemType, NoteBlock, Snapshot, Tag};
+use crate::models::{
+    BlockKind, Category, CategoryField, HistoryEntry, ItemType, NoteBlock, Snapshot, Tag,
+};
 use crate::notes::detect_language;
 use crate::ops::{
-    bump, new_id, non_empty, BlockInput, CategoryUpdate, FieldInput, FieldView, ItemDetail,
-    ItemSummary, ItemUpdate, NewCategory, NewItem, VaultStore, WriteCtx,
+    bump, new_id, non_empty, plan_field_update, BlockInput, CategoryUpdate, FieldInput, FieldView,
+    ItemDetail, ItemSummary, ItemUpdate, NewCategory, NewItem, VaultStore, WriteCtx,
 };
+use crate::presets::seed_records;
 use crate::side_blob::sha256_hex;
 use crate::tagger::suggest_tags;
 
@@ -856,6 +859,9 @@ impl Database {
     /// Create a category, appended after the existing ones.
     pub fn create_category(&mut self, ctx: &WriteCtx<'_>, new: &NewCategory) -> Result<Category> {
         non_empty(&new.name)?;
+        if new.fields.iter().any(|f| f.id.is_some()) {
+            return Err(Error::InvalidInput);
+        }
         let tx = self.begin(ctx)?;
         let id = new_id(ctx)?;
         tx.execute(
@@ -866,6 +872,8 @@ impl Database {
             params![id, new.name, new.color, new.icon, new.icon_color, ctx.now_ms, ctx.device_id],
         )
         .map_err(db_err)?;
+        let planned = plan_field_update(ctx, &id, &[], &new.fields)?;
+        write_category_fields(&tx, &planned)?;
         let c = read_category(&tx, &id)?;
         tx.commit().map_err(db_err)?;
         Ok(c)
@@ -893,6 +901,11 @@ impl Database {
             .icon_color
             .clone()
             .unwrap_or_else(|| c.icon_color.clone());
+        if let Some(inputs) = &upd.fields {
+            let existing = read_category_fields(&tx, id, true)?;
+            let planned = plan_field_update(ctx, id, &existing, inputs)?;
+            write_category_fields(&tx, &planned)?;
+        }
         if (&name, &color, &icon, &icon_color) != (&c.name, &c.color, &c.icon, &c.icon_color) {
             tx.execute(
                 "UPDATE categories SET name=?2,color=?3,icon=?4,icon_color=?5,updated_at=?6,updated_by=?7 WHERE id=?1",
@@ -956,6 +969,51 @@ impl Database {
             .collect()
     }
 
+    /// Live inputs of a live category in display order.
+    pub fn list_category_fields(&self, category_id: &str) -> Result<Vec<CategoryField>> {
+        let c = read_category(self.conn(), category_id)?;
+        if c.deleted_at.is_some() {
+            return Err(Error::NotFound);
+        }
+        read_category_fields(self.conn(), category_id, false)
+    }
+
+    /// Create the preset categories that do not exist yet. Idempotent.
+    pub fn seed_default_categories(&mut self, ctx: &WriteCtx<'_>) -> Result<()> {
+        let tx = self.begin(ctx)?;
+        let ids: Vec<String> = {
+            let mut stmt = tx.prepare("SELECT id FROM categories").map_err(db_err)?;
+            let rows = stmt
+                .query_map([], |r| r.get::<_, String>(0))
+                .map_err(db_err)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(db_err)?;
+            rows
+        };
+        let first: i64 = tx
+            .query_row(
+                "SELECT coalesce(max(sort_order)+1,0) FROM categories WHERE deleted_at IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(db_err)?;
+        let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let (cats, fields) = seed_records(ctx, &refs, first);
+        for c in &cats {
+            tx.execute(
+                "INSERT INTO categories(id,name,color,icon,icon_color,preset,sort_order,created_at,updated_at,updated_by)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                params![
+                    c.id, c.name, c.color, c.icon, c.icon_color, c.preset, c.sort_order,
+                    c.created_at, c.updated_at, c.updated_by
+                ],
+            )
+            .map_err(db_err)?;
+        }
+        write_category_fields(&tx, &fields)?;
+        tx.commit().map_err(db_err)
+    }
+
     // ---- note images -------------------------------------------------------------------
 
     /// Store an immutable image for use by an image block. Returns its id.
@@ -1015,9 +1073,62 @@ fn read_tag(conn: &Connection, id: &str) -> Result<Tag> {
     .ok_or(Error::NotFound)
 }
 
+/// Fields of a category in display order; `with_deleted` includes tombstones.
+fn read_category_fields(
+    conn: &Connection,
+    category_id: &str,
+    with_deleted: bool,
+) -> Result<Vec<CategoryField>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id,category_id,name,kind,is_secret,is_core,sort_order,updated_at,updated_by,deleted_at
+             FROM category_fields WHERE category_id=?1 AND (?2 OR deleted_at IS NULL)
+             ORDER BY sort_order,id",
+        )
+        .map_err(db_err)?;
+    let rows = stmt
+        .query_map(params![category_id, with_deleted], |r| {
+            Ok(CategoryField {
+                id: r.get(0)?,
+                category_id: r.get(1)?,
+                name: r.get(2)?,
+                kind: r.get(3)?,
+                is_secret: r.get(4)?,
+                is_core: r.get(5)?,
+                sort_order: r.get(6)?,
+                updated_at: r.get(7)?,
+                updated_by: r.get(8)?,
+                deleted_at: r.get(9)?,
+            })
+        })
+        .map_err(db_err)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(db_err)?;
+    Ok(rows)
+}
+
+fn write_category_fields(conn: &Connection, fields: &[CategoryField]) -> Result<()> {
+    for f in fields {
+        conn.execute(
+            "INSERT INTO category_fields(id,category_id,name,kind,is_secret,is_core,sort_order,updated_at,updated_by,deleted_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
+             ON CONFLICT(id) DO UPDATE SET name=excluded.name,kind=excluded.kind,
+               is_secret=excluded.is_secret,sort_order=excluded.sort_order,
+               updated_at=excluded.updated_at,updated_by=excluded.updated_by,
+               deleted_at=excluded.deleted_at",
+            params![
+                f.id, f.category_id, f.name, f.kind, f.is_secret, f.is_core, f.sort_order,
+                f.updated_at, f.updated_by, f.deleted_at
+            ],
+        )
+        .map_err(db_err)?;
+    }
+    Ok(())
+}
+
 fn read_category(conn: &Connection, id: &str) -> Result<Category> {
     conn.query_row(
-        "SELECT id,name,color,icon,icon_color,sort_order,created_at,updated_at,updated_by,deleted_at
+        "SELECT id,name,color,icon,icon_color,sort_order,created_at,updated_at,updated_by,deleted_at,preset
          FROM categories WHERE id=?1",
         [id],
         |r| {
@@ -1032,6 +1143,7 @@ fn read_category(conn: &Connection, id: &str) -> Result<Category> {
                 updated_at: r.get(7)?,
                 updated_by: r.get(8)?,
                 deleted_at: r.get(9)?,
+                preset: r.get(10)?,
             })
         },
     )
@@ -1088,6 +1200,8 @@ impl VaultStore for Database {
         fn reorder_categories(&mut Self, ctx: &WriteCtx<'_>, ordered_ids: &[String]) -> Result<()>;
         fn delete_category(&mut Self, ctx: &WriteCtx<'_>, id: &str) -> Result<()>;
         fn list_categories(&Self) -> Result<Vec<Category>>;
+        fn list_category_fields(&Self, category_id: &str) -> Result<Vec<CategoryField>>;
+        fn seed_default_categories(&mut Self, ctx: &WriteCtx<'_>) -> Result<()>;
         fn add_note_image(&mut Self, ctx: &WriteCtx<'_>, mime_type: &str, data: &[u8]) -> Result<String>;
         fn note_image(&Self, id: &str) -> Result<(String, Zeroizing<Vec<u8>>)>;
         fn merge_remote(&mut Self, remote: &Snapshot) -> Result<()>;

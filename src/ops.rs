@@ -17,7 +17,9 @@ use std::fmt;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::error::{Error, Result};
-use crate::models::{BlockKind, Category, HistoryEntry, ItemType, NoteBlock, Snapshot, Tag};
+use crate::models::{
+    BlockKind, Category, CategoryField, HistoryEntry, InputKind, ItemType, NoteBlock, Snapshot, Tag,
+};
 
 /// Time and writer identity for a write. Injected so core stays free of wall-clock access.
 #[derive(Clone, Copy, Debug)]
@@ -39,6 +41,34 @@ pub struct NewCategory {
     pub icon: String,
     /// Icon color (independent from `color`).
     pub icon_color: String,
+    /// Extra inputs of the category form (all ids must be `None`; never core).
+    pub fields: Vec<CategoryFieldInput>,
+}
+
+/// Input for one category field. `id: None` creates a (non-core) field; `Some` targets that
+/// existing field.
+#[derive(Clone, Debug)]
+pub struct CategoryFieldInput {
+    /// Existing field id, or `None` for a new field.
+    pub id: Option<String>,
+    /// Display name (non-empty).
+    pub name: String,
+    /// Input type: an [`InputKind`] storage identifier.
+    pub kind: String,
+    /// Whether values are secret. Ignored for core fields (fixed).
+    pub is_secret: bool,
+}
+
+impl CategoryFieldInput {
+    /// New field of `kind`, secret by the kind's default.
+    pub fn new(name: &str, kind: InputKind) -> Self {
+        Self {
+            id: None,
+            name: name.to_string(),
+            kind: kind.as_str().to_string(),
+            is_secret: kind.secret_by_default(),
+        }
+    }
 }
 
 /// Input for one item field. `id: None` creates a field; `Some` updates that existing field.
@@ -193,6 +223,9 @@ pub struct CategoryUpdate {
     pub icon: Option<String>,
     /// New icon color.
     pub icon_color: Option<String>,
+    /// Complete new field template. Live fields missing from the list are tombstoned, except
+    /// core fields: omitting one fails with [`Error::InvalidInput`] and changes nothing.
+    pub fields: Option<Vec<CategoryFieldInput>>,
 }
 
 /// Non-secret list row.
@@ -311,6 +344,11 @@ pub trait VaultStore {
     fn delete_category(&mut self, ctx: &WriteCtx<'_>, id: &str) -> Result<()>;
     /// Live categories in display order.
     fn list_categories(&self) -> Result<Vec<Category>>;
+    /// Live inputs of a live category in display order.
+    fn list_category_fields(&self, category_id: &str) -> Result<Vec<CategoryField>>;
+    /// Create the built-in preset categories that do not exist yet (tombstoned ones are not
+    /// re-created). Idempotent; call after creating or unlocking a vault.
+    fn seed_default_categories(&mut self, ctx: &WriteCtx<'_>) -> Result<()>;
     /// Store an immutable note image; returns its id.
     fn add_note_image(
         &mut self,
@@ -324,4 +362,88 @@ pub trait VaultStore {
     fn snapshot(&self) -> Result<Snapshot>;
     /// Merge a decrypted remote snapshot atomically.
     fn merge_remote(&mut self, remote: &Snapshot) -> Result<()>;
+}
+
+/// Validate a category field input and turn it into a record body.
+fn check_input(i: &CategoryFieldInput) -> Result<InputKind> {
+    non_empty(&i.name)?;
+    InputKind::parse(&i.kind)
+}
+
+/// Records to upsert for a category's new complete field template.
+///
+/// `existing` are all stored fields of the category (tombstones included). Returns only records
+/// that actually change; core fields keep their kind and secrecy and cannot be omitted.
+pub(crate) fn plan_field_update(
+    ctx: &WriteCtx<'_>,
+    category_id: &str,
+    existing: &[CategoryField],
+    inputs: &[CategoryFieldInput],
+) -> Result<Vec<CategoryField>> {
+    let mut out: Vec<CategoryField> = Vec::new();
+    let mut seen: Vec<&str> = Vec::new();
+    for (pos, input) in inputs.iter().enumerate() {
+        let kind = check_input(input)?;
+        let order = i64::try_from(pos).map_err(|_| Error::InvalidInput)?;
+        match &input.id {
+            None => out.push(CategoryField {
+                id: new_id(ctx)?,
+                category_id: category_id.to_string(),
+                name: input.name.trim().to_string(),
+                kind: kind.as_str().to_string(),
+                is_secret: input.is_secret,
+                is_core: false,
+                sort_order: order,
+                updated_at: ctx.now_ms,
+                updated_by: ctx.device_id.to_string(),
+                deleted_at: None,
+            }),
+            Some(id) => {
+                if seen.contains(&id.as_str()) {
+                    return Err(Error::InvalidInput);
+                }
+                seen.push(id);
+                let cur = existing
+                    .iter()
+                    .find(|f| &f.id == id && f.deleted_at.is_none())
+                    .ok_or(Error::NotFound)?;
+                let (kind_s, secret) = if cur.is_core {
+                    if kind.as_str() != cur.kind {
+                        return Err(Error::InvalidInput);
+                    }
+                    (cur.kind.clone(), cur.is_secret)
+                } else {
+                    (kind.as_str().to_string(), input.is_secret)
+                };
+                let name = input.name.trim().to_string();
+                if (&name, &kind_s, secret, cur.sort_order)
+                    != (&cur.name, &cur.kind, cur.is_secret, order)
+                {
+                    let mut f = cur.clone();
+                    f.name = name;
+                    f.kind = kind_s;
+                    f.is_secret = secret;
+                    f.sort_order = order;
+                    f.updated_at = bump(cur.updated_at, ctx.now_ms);
+                    f.updated_by = ctx.device_id.to_string();
+                    out.push(f);
+                }
+            }
+        }
+    }
+    for cur in existing.iter().filter(|f| f.deleted_at.is_none()) {
+        if seen.contains(&cur.id.as_str()) {
+            continue;
+        }
+        if cur.is_core {
+            return Err(Error::InvalidInput);
+        }
+        let mut f = cur.clone();
+        let t = bump(cur.updated_at, ctx.now_ms);
+        f.deleted_at = Some(t);
+        f.updated_at = t;
+        f.updated_by = ctx.device_id.to_string();
+        out.push(f);
+    }
+    Ok(out)
 }

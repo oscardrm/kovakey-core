@@ -18,8 +18,8 @@ use super::{db_err, Database};
 use crate::error::{Error, Result};
 use crate::merge::merge;
 use crate::models::{
-    BlockKind, Category, HistoryEntry, Item, ItemField, ItemTag, ItemType, NoteBlock, NoteImage,
-    Snapshot, Tag, VaultMeta,
+    BlockKind, Category, CategoryField, HistoryEntry, Item, ItemField, ItemTag, ItemType,
+    NoteBlock, NoteImage, Snapshot, Tag, VaultMeta,
 };
 
 fn corrupt(idx: usize, e: Error) -> rusqlite::Error {
@@ -55,7 +55,7 @@ fn read_all(conn: &Connection) -> Result<Snapshot> {
     )?;
     let categories = query(
         conn,
-        "SELECT id,name,color,icon,icon_color,sort_order,created_at,updated_at,updated_by,deleted_at
+        "SELECT id,name,color,icon,icon_color,sort_order,created_at,updated_at,updated_by,deleted_at,preset
          FROM categories ORDER BY id",
         |r| {
             Ok(Category {
@@ -66,6 +66,26 @@ fn read_all(conn: &Connection) -> Result<Snapshot> {
                 icon_color: r.get(4)?,
                 sort_order: r.get(5)?,
                 created_at: r.get(6)?,
+                updated_at: r.get(7)?,
+                updated_by: r.get(8)?,
+                deleted_at: r.get(9)?,
+                preset: r.get(10)?,
+            })
+        },
+    )?;
+    let category_fields = query(
+        conn,
+        "SELECT id,category_id,name,kind,is_secret,is_core,sort_order,updated_at,updated_by,deleted_at
+         FROM category_fields ORDER BY id",
+        |r| {
+            Ok(CategoryField {
+                id: r.get(0)?,
+                category_id: r.get(1)?,
+                name: r.get(2)?,
+                kind: r.get(3)?,
+                is_secret: r.get(4)?,
+                is_core: r.get(5)?,
+                sort_order: r.get(6)?,
                 updated_at: r.get(7)?,
                 updated_by: r.get(8)?,
                 deleted_at: r.get(9)?,
@@ -208,6 +228,7 @@ fn read_all(conn: &Connection) -> Result<Snapshot> {
     Ok(Snapshot {
         vault_meta,
         categories,
+        category_fields,
         tags,
         items,
         item_fields,
@@ -245,16 +266,33 @@ fn write_all(conn: &Connection, snap: &Snapshot) -> Result<()> {
     }
     for c in &snap.categories {
         conn.execute(
-            "INSERT INTO categories(id,name,color,icon,icon_color,sort_order,created_at,updated_at,updated_by,deleted_at)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
+            "INSERT INTO categories(id,name,color,icon,icon_color,sort_order,created_at,updated_at,updated_by,deleted_at,preset)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
              ON CONFLICT(id) DO UPDATE SET name=excluded.name,color=excluded.color,
                icon=excluded.icon,icon_color=excluded.icon_color,sort_order=excluded.sort_order,
+               preset=excluded.preset,
                created_at=excluded.created_at,updated_at=excluded.updated_at,
                updated_by=excluded.updated_by,deleted_at=excluded.deleted_at
              WHERE (excluded.updated_at,excluded.updated_by) >= (categories.updated_at,categories.updated_by)",
             params![
                 c.id, c.name, c.color, c.icon, c.icon_color, c.sort_order, c.created_at,
-                c.updated_at, c.updated_by, c.deleted_at
+                c.updated_at, c.updated_by, c.deleted_at, c.preset
+            ],
+        )
+        .map_err(db_err)?;
+    }
+    for f in &snap.category_fields {
+        conn.execute(
+            "INSERT INTO category_fields(id,category_id,name,kind,is_secret,is_core,sort_order,updated_at,updated_by,deleted_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
+             ON CONFLICT(id) DO UPDATE SET category_id=excluded.category_id,name=excluded.name,
+               kind=excluded.kind,is_secret=excluded.is_secret,is_core=excluded.is_core,
+               sort_order=excluded.sort_order,updated_at=excluded.updated_at,
+               updated_by=excluded.updated_by,deleted_at=excluded.deleted_at
+             WHERE (excluded.updated_at,excluded.updated_by) >= (category_fields.updated_at,category_fields.updated_by)",
+            params![
+                f.id, f.category_id, f.name, f.kind, f.is_secret, f.is_core, f.sort_order,
+                f.updated_at, f.updated_by, f.deleted_at
             ],
         )
         .map_err(db_err)?;

@@ -9,8 +9,8 @@ mod snapshot;
 mod store;
 
 pub use crate::ops::{
-    BlockInput, CategoryUpdate, FieldInput, FieldView, ItemDetail, ItemSummary, ItemUpdate,
-    NewCategory, NewItem, VaultStore, WriteCtx,
+    BlockInput, CategoryFieldInput, CategoryUpdate, FieldInput, FieldView, ItemDetail, ItemSummary,
+    ItemUpdate, NewCategory, NewItem, VaultStore, WriteCtx,
 };
 
 use std::path::Path;
@@ -25,6 +25,7 @@ use crate::error::{Error, Result};
 const MIGRATIONS: &[&str] = &[
     include_str!("migrations/001_initial.sql"),
     include_str!("migrations/002_sync_columns.sql"),
+    include_str!("migrations/003_category_fields.sql"),
 ];
 
 /// Latest schema version known to this build.

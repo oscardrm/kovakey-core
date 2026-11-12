@@ -294,7 +294,7 @@ mod tests {
     fn unknown_snapshot_version_is_unsupported() {
         let (h, k) = vault();
         let mut f = seal_vault(&h, &k, &sample(false)).unwrap().file;
-        f[HEADER_LEN] = 2;
+        f[HEADER_LEN] = 3;
         assert_eq!(
             open(&f, &k, &HashMap::new()).unwrap_err(),
             Error::UnsupportedVersion
@@ -388,6 +388,9 @@ mod tests {
     fn golden_v1_vault_file_still_opens_with_the_password() {
         let file = std::fs::read(GOLDEN).unwrap();
         let keys = read_header(&file).unwrap().unlock(PW).unwrap();
-        assert_eq!(open(&file, &keys, &HashMap::new()).unwrap(), sample(false));
+        assert_eq!(
+            open(&file, &keys, &HashMap::new()).unwrap(),
+            crate::codec::fixtures::v1_view(sample(false))
+        );
     }
 }

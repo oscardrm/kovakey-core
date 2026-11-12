@@ -18,6 +18,7 @@ pub mod merge;
 pub mod models;
 pub mod notes;
 pub mod ops;
+pub mod presets;
 pub mod recovery;
 pub mod search;
 pub mod session;

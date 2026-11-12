@@ -19,6 +19,7 @@ fn populated(device: &str) -> Database {
                 color: "#112233".into(),
                 icon: "bank".into(),
                 icon_color: "#445566".into(),
+                fields: vec![],
             },
         )
         .unwrap();

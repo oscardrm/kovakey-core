@@ -20,7 +20,8 @@
 use std::collections::BTreeMap;
 
 use crate::models::{
-    Category, Item, ItemField, ItemTag, NoteBlock, NoteImage, Snapshot, Tag, VaultMeta,
+    Category, CategoryField, Item, ItemField, ItemTag, NoteBlock, NoteImage, Snapshot, Tag,
+    VaultMeta,
 };
 
 /// A record that participates in LWW merge.
@@ -82,6 +83,7 @@ pub fn merge(local: &Snapshot, remote: &Snapshot) -> Snapshot {
     Snapshot {
         vault_meta: merge_records(&local.vault_meta, &remote.vault_meta),
         categories: merge_records(&local.categories, &remote.categories),
+        category_fields: merge_records(&local.category_fields, &remote.category_fields),
         tags: merge_records(&local.tags, &remote.tags),
         items: merge_records(&local.items, &remote.items),
         item_fields: merge_records(&local.item_fields, &remote.item_fields),
@@ -99,6 +101,7 @@ pub fn max_future_skew(s: &Snapshot, now_ms: i64) -> i64 {
         .iter()
         .map(|r| r.updated_at)
         .chain(s.categories.iter().map(|r| r.updated_at))
+        .chain(s.category_fields.iter().map(|r| r.updated_at))
         .chain(s.tags.iter().map(|r| r.updated_at))
         .chain(s.items.iter().map(|r| r.updated_at))
         .chain(s.item_fields.iter().map(|r| r.updated_at))
@@ -123,7 +126,14 @@ macro_rules! versioned_by_id {
     )*};
 }
 
-versioned_by_id!(Category, Tag, ItemField, NoteBlock, VaultMeta);
+versioned_by_id!(
+    Category,
+    CategoryField,
+    Tag,
+    ItemField,
+    NoteBlock,
+    VaultMeta
+);
 
 impl Versioned for ItemTag {
     fn key(&self) -> String {
@@ -157,7 +167,7 @@ impl Versioned for Item {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{BlockKind, HistoryEntry, ItemType};
+    use crate::models::{BlockKind, CategoryField, HistoryEntry, ItemType};
     use proptest::prelude::*;
     use std::collections::BTreeSet;
 
@@ -358,8 +368,32 @@ mod tests {
                 color: "#000".into(),
                 icon: "i".into(),
                 icon_color: "#fff".into(),
+                preset: None,
                 sort_order: 0,
                 created_at: 0,
+                updated_at: t,
+                updated_by: format!("d{dev}"),
+                deleted_at: del,
+            })
+    }
+
+    fn arb_category_field() -> impl Strategy<Value = CategoryField> {
+        (
+            0u8..3,
+            "[a-c]{1,2}",
+            0i64..4,
+            0u8..3,
+            proptest::option::of(0i64..4),
+            any::<bool>(),
+        )
+            .prop_map(|(id, name, t, dev, del, core)| CategoryField {
+                id: format!("cf{id}"),
+                category_id: "c0".into(),
+                name,
+                kind: "text".into(),
+                is_secret: false,
+                is_core: core,
+                sort_order: 0,
                 updated_at: t,
                 updated_by: format!("d{dev}"),
                 deleted_at: del,
@@ -373,21 +407,25 @@ mod tests {
             proptest::collection::vec(arb_item_tag(), 0..4),
             proptest::collection::vec(arb_block(), 0..4),
             proptest::collection::vec(arb_category(), 0..3),
+            proptest::collection::vec(arb_category_field(), 0..3),
         )
-            .prop_map(|(items, item_fields, item_tags, note_blocks, categories)| {
-                // Normalize duplicate keys inside one generated side.
-                merge(
-                    &Snapshot::default(),
-                    &Snapshot {
-                        items,
-                        item_fields,
-                        item_tags,
-                        note_blocks,
-                        categories,
-                        ..Default::default()
-                    },
-                )
-            })
+            .prop_map(
+                |(items, item_fields, item_tags, note_blocks, categories, category_fields)| {
+                    // Normalize duplicate keys inside one generated side.
+                    merge(
+                        &Snapshot::default(),
+                        &Snapshot {
+                            items,
+                            item_fields,
+                            item_tags,
+                            note_blocks,
+                            categories,
+                            category_fields,
+                            ..Default::default()
+                        },
+                    )
+                },
+            )
     }
 
     proptest! {

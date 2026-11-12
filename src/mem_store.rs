@@ -15,14 +15,15 @@ use zeroize::{Zeroize, Zeroizing};
 use crate::error::{Error, Result};
 use crate::merge::merge;
 use crate::models::{
-    BlockKind, Category, HistoryEntry, Item, ItemField, ItemTag, NoteBlock, NoteImage, Snapshot,
-    Tag,
+    BlockKind, Category, CategoryField, HistoryEntry, Item, ItemField, ItemTag, NoteBlock,
+    NoteImage, Snapshot, Tag,
 };
 use crate::notes::detect_language;
 use crate::ops::{
-    bump, new_id, non_empty, BlockInput, CategoryUpdate, FieldInput, FieldView, ItemDetail,
-    ItemSummary, ItemUpdate, NewCategory, NewItem, VaultStore, WriteCtx,
+    bump, new_id, non_empty, plan_field_update, BlockInput, CategoryUpdate, FieldInput, FieldView,
+    ItemDetail, ItemSummary, ItemUpdate, NewCategory, NewItem, VaultStore, WriteCtx,
 };
+use crate::presets::seed_records;
 use crate::side_blob::sha256_hex;
 use crate::tagger::suggest_tags;
 
@@ -42,6 +43,9 @@ fn check_integrity(s: &Snapshot) -> Result<()> {
         .items
         .iter()
         .all(|i| i.category_id.as_deref().map_or(true, |c| cats.contains(c)))
+        && s.category_fields
+            .iter()
+            .all(|f| cats.contains(f.category_id.as_str()))
         && s.item_fields
             .iter()
             .all(|f| items.contains(f.item_id.as_str()))
@@ -80,6 +84,16 @@ fn require_live_category(s: &Snapshot, id: &str) -> Result<()> {
         .any(|c| c.id == id && c.deleted_at.is_none())
         .then_some(())
         .ok_or(Error::NotFound)
+}
+
+/// Insert or replace category fields by id.
+fn upsert_category_fields(s: &mut Snapshot, planned: Vec<CategoryField>) {
+    for f in planned {
+        match s.category_fields.iter_mut().find(|e| e.id == f.id) {
+            Some(slot) => *slot = f,
+            None => s.category_fields.push(f),
+        }
+    }
 }
 
 fn live_tag_by_name<'a>(s: &'a Snapshot, name: &str) -> Option<&'a Tag> {
@@ -757,6 +771,9 @@ impl VaultStore for MemStore {
 
     fn create_category(&mut self, ctx: &WriteCtx<'_>, new: &NewCategory) -> Result<Category> {
         non_empty(&new.name)?;
+        if new.fields.iter().any(|f| f.id.is_some()) {
+            return Err(Error::InvalidInput);
+        }
         self.tx(ctx, |s| {
             let sort_order = s
                 .categories
@@ -771,13 +788,16 @@ impl VaultStore for MemStore {
                 color: new.color.clone(),
                 icon: new.icon.clone(),
                 icon_color: new.icon_color.clone(),
+                preset: None,
                 sort_order,
                 created_at: ctx.now_ms,
                 updated_at: ctx.now_ms,
                 updated_by: ctx.device_id.to_string(),
                 deleted_at: None,
             };
+            let planned = plan_field_update(ctx, &c.id, &[], &new.fields)?;
             s.categories.push(c.clone());
+            upsert_category_fields(s, planned);
             Ok(c)
         })
     }
@@ -804,6 +824,22 @@ impl VaultStore for MemStore {
                 .icon_color
                 .clone()
                 .unwrap_or_else(|| c.icon_color.clone());
+            let cat_id = c.id.clone();
+            if let Some(inputs) = &upd.fields {
+                let existing: Vec<CategoryField> = s
+                    .category_fields
+                    .iter()
+                    .filter(|f| f.category_id == cat_id)
+                    .cloned()
+                    .collect();
+                let planned = plan_field_update(ctx, &cat_id, &existing, inputs)?;
+                upsert_category_fields(s, planned);
+            }
+            let c = s
+                .categories
+                .iter_mut()
+                .find(|c| c.id == id && c.deleted_at.is_none())
+                .ok_or(Error::NotFound)?;
             if (&name, &color, &icon, &icon_color) != (&c.name, &c.color, &c.icon, &c.icon_color) {
                 c.name = name;
                 c.color = color;
@@ -860,6 +896,36 @@ impl VaultStore for MemStore {
             .collect();
         v.sort_by(|a, b| (a.sort_order, &a.id).cmp(&(b.sort_order, &b.id)));
         Ok(v)
+    }
+
+    fn list_category_fields(&self, category_id: &str) -> Result<Vec<CategoryField>> {
+        require_live_category(&self.snap, category_id)?;
+        let mut v: Vec<CategoryField> = self
+            .snap
+            .category_fields
+            .iter()
+            .filter(|f| f.category_id == category_id && f.deleted_at.is_none())
+            .cloned()
+            .collect();
+        v.sort_by(|a, b| (a.sort_order, &a.id).cmp(&(b.sort_order, &b.id)));
+        Ok(v)
+    }
+
+    fn seed_default_categories(&mut self, ctx: &WriteCtx<'_>) -> Result<()> {
+        self.tx(ctx, |s| {
+            let ids: Vec<&str> = s.categories.iter().map(|c| c.id.as_str()).collect();
+            let first = s
+                .categories
+                .iter()
+                .filter(|c| c.deleted_at.is_none())
+                .map(|c| c.sort_order.saturating_add(1))
+                .max()
+                .unwrap_or(0);
+            let (cats, fields) = seed_records(ctx, &ids, first);
+            s.categories.extend(cats);
+            s.category_fields.extend(fields);
+            Ok(())
+        })
     }
 
     fn add_note_image(

@@ -1,8 +1,8 @@
 use super::common::{ctx, login};
 use vault_core::db::{
-    BlockInput, CategoryUpdate, FieldInput, ItemUpdate, NewCategory, NewItem, VaultStore,
+    BlockInput, CategoryFieldInput, CategoryUpdate, FieldInput, ItemUpdate, NewCategory, NewItem, VaultStore,
 };
-use vault_core::models::{BlockKind, ItemType};
+use vault_core::models::{BlockKind, InputKind, ItemType};
 use vault_core::Error;
 
 // Included twice by `crud.rs`: once per `VaultStore` backend. `Store` and `db()` are defined there.
@@ -344,6 +344,7 @@ fn new_cat(name: &str) -> NewCategory {
         color: "#101010".into(),
         icon: "folder".into(),
         icon_color: "#f0f0f0".into(),
+        fields: vec![],
     }
 }
 
@@ -476,4 +477,184 @@ fn invalid_input_is_rejected_without_side_effects() {
 fn field_input_debug_never_prints_the_value() {
     let f = FieldInput::new("password", "password", "fake-do-not-print", true);
     assert!(!format!("{f:?}").contains("fake-do-not-print"));
+}
+
+// ---- preset categories and their editable field templates ---------------------------------
+
+fn card(d: &Store) -> vault_core::models::Category {
+    d.list_categories()
+        .unwrap()
+        .into_iter()
+        .find(|c| c.preset.as_deref() == Some("card"))
+        .unwrap()
+}
+
+/// The category's template as inputs targeting the existing fields (an unchanged edit).
+fn template(d: &Store, cat: &str) -> Vec<CategoryFieldInput> {
+    d.list_category_fields(cat)
+        .unwrap()
+        .into_iter()
+        .map(|f| CategoryFieldInput {
+            id: Some(f.id),
+            name: f.name,
+            kind: f.kind,
+            is_secret: f.is_secret,
+        })
+        .collect()
+}
+
+#[test]
+fn seeding_creates_editable_preset_categories_once() {
+    let mut d = db();
+    d.seed_default_categories(&ctx("dev-a", 100)).unwrap();
+    let n = d.list_categories().unwrap().len();
+    assert!(n >= 7);
+    d.seed_default_categories(&ctx("dev-b", 200)).unwrap();
+    assert_eq!(d.list_categories().unwrap().len(), n);
+
+    let c = card(&d);
+    let fields = d.list_category_fields(&c.id).unwrap();
+    let core: Vec<_> = fields.iter().filter(|f| f.is_core).map(|f| f.kind.as_str()).collect();
+    assert_eq!(core, ["card_number", "expiry", "cvv"]);
+
+    // Fully editable like any category.
+    d.update_category(
+        &ctx("dev-a", 300),
+        &c.id,
+        &CategoryUpdate {
+            name: Some("Cards".into()),
+            icon: Some("star".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(card(&d).name, "Cards");
+
+    // A deleted preset stays deleted.
+    d.delete_category(&ctx("dev-a", 400), &c.id).unwrap();
+    d.seed_default_categories(&ctx("dev-a", 500)).unwrap();
+    assert!(d.list_categories().unwrap().iter().all(|x| x.id != c.id));
+}
+
+#[test]
+fn core_inputs_cannot_be_deleted_but_extras_can_be_added_and_removed() {
+    let mut d = db();
+    d.seed_default_categories(&ctx("dev-a", 100)).unwrap();
+    let c = card(&d);
+    let base = template(&d, &c.id);
+
+    // Omitting a core input fails and changes nothing.
+    let mut without_core = base.clone();
+    without_core.retain(|f| f.kind != "cvv");
+    let r = d.update_category(
+        &ctx("dev-a", 200),
+        &c.id,
+        &CategoryUpdate { fields: Some(without_core), ..Default::default() },
+    );
+    assert_eq!(r, Err(Error::InvalidInput));
+    assert_eq!(d.list_category_fields(&c.id).unwrap().len(), base.len());
+
+    // Core kind is fixed.
+    let mut retyped = base.clone();
+    for f in &mut retyped {
+        if f.kind == "cvv" {
+            f.kind = "text".into();
+        }
+    }
+    let r = d.update_category(
+        &ctx("dev-a", 210),
+        &c.id,
+        &CategoryUpdate { fields: Some(retyped), ..Default::default() },
+    );
+    assert_eq!(r, Err(Error::InvalidInput));
+
+    // Extras: add one (with a chosen input type) ...
+    let mut with_extra = base.clone();
+    with_extra.push(CategoryFieldInput::new("Billing address", InputKind::SecureNote));
+    d.update_category(
+        &ctx("dev-a", 300),
+        &c.id,
+        &CategoryUpdate { fields: Some(with_extra), ..Default::default() },
+    )
+    .unwrap();
+    let fields = d.list_category_fields(&c.id).unwrap();
+    assert_eq!(fields.len(), base.len() + 1);
+    let extra = fields.last().unwrap();
+    assert_eq!((extra.kind.as_str(), extra.is_core, extra.is_secret), ("secure_note", false, true));
+
+    // ... rename a core input (allowed) and remove the extra again.
+    let mut edited = template(&d, &c.id);
+    edited.pop();
+    for f in &mut edited {
+        if f.kind == "cvv" {
+            f.name = "Security code".into();
+        }
+    }
+    d.update_category(
+        &ctx("dev-a", 400),
+        &c.id,
+        &CategoryUpdate { fields: Some(edited), ..Default::default() },
+    )
+    .unwrap();
+    let fields = d.list_category_fields(&c.id).unwrap();
+    assert_eq!(fields.len(), base.len());
+    assert!(fields.iter().any(|f| f.name == "Security code" && f.is_core));
+}
+
+#[test]
+fn custom_categories_take_extra_inputs_on_create_and_reject_bad_kinds() {
+    let mut d = db();
+    let mut new = new_cat("Wi-Fi");
+    new.fields = vec![
+        CategoryFieldInput::new("Network", InputKind::Text),
+        CategoryFieldInput::new("Password", InputKind::Password),
+    ];
+    let c = d.create_category(&ctx("dev-a", 100), &new).unwrap();
+    assert!(c.preset.is_none());
+    let fields = d.list_category_fields(&c.id).unwrap();
+    assert_eq!(fields.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(), ["Network", "Password"]);
+    assert!(fields.iter().all(|f| !f.is_core));
+
+    let mut bad = new_cat("Bad");
+    bad.fields = vec![CategoryFieldInput {
+        id: None,
+        name: "x".into(),
+        kind: "bogus".into(),
+        is_secret: false,
+    }];
+    assert_eq!(d.create_category(&ctx("dev-a", 200), &bad).err(), Some(Error::InvalidInput));
+    assert_eq!(d.list_categories().unwrap().len(), 1);
+
+    // Extras are deletable on custom categories.
+    d.update_category(
+        &ctx("dev-a", 300),
+        &c.id,
+        &CategoryUpdate { fields: Some(vec![]), ..Default::default() },
+    )
+    .unwrap();
+    assert!(d.list_category_fields(&c.id).unwrap().is_empty());
+}
+
+#[test]
+fn category_templates_survive_snapshot_merge() {
+    let mut a = db();
+    a.seed_default_categories(&ctx("dev-a", 100)).unwrap();
+    let c = card(&a);
+    let mut inputs = template(&a, &c.id);
+    inputs.push(CategoryFieldInput::new("Notes", InputKind::Text));
+    a.update_category(
+        &ctx("dev-a", 200),
+        &c.id,
+        &CategoryUpdate { fields: Some(inputs), ..Default::default() },
+    )
+    .unwrap();
+    let mut b = db();
+    b.seed_default_categories(&ctx("dev-b", 300)).unwrap();
+    b.merge_remote(&a.snapshot().unwrap()).unwrap();
+    // Same preset ids on both devices: no duplicates, and A's later edit wins over B's seed.
+    assert_eq!(b.list_categories().unwrap().len(), a.list_categories().unwrap().len());
+    assert_eq!(
+        b.list_category_fields(&c.id).unwrap().len(),
+        a.list_category_fields(&c.id).unwrap().len()
+    );
 }

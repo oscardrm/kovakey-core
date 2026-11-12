@@ -188,10 +188,151 @@ pub struct Category {
     pub icon: String,
     /// Icon color, independent from `color`.
     pub icon_color: String,
+    /// Stable key of the built-in preset this category was seeded from (e.g. `card`), if any.
+    /// Presets are ordinary, fully editable categories; the key only lets the app recognise them
+    /// (item behaviour, localized default names). `None` for user-created categories.
+    pub preset: Option<String>,
     /// Display order.
     pub sort_order: i64,
     /// Creation time, Unix ms UTC.
     pub created_at: i64,
+    /// Last modification time, Unix ms UTC.
+    pub updated_at: i64,
+    /// Device id of the last writer.
+    pub updated_by: String,
+    /// Tombstone time.
+    pub deleted_at: Option<i64>,
+}
+
+/// Input type of a category field (what kind of value the input holds). Stored as the `kind`
+/// string of both [`CategoryField`] and the [`ItemField`]s created from it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum InputKind {
+    /// Single-line text.
+    Text,
+    /// Password (changes are recorded in the password history).
+    Password,
+    /// Multi-line secret note.
+    SecureNote,
+    /// TOTP secret.
+    Totp,
+    /// URL.
+    Url,
+    /// E-mail address.
+    Email,
+    /// Phone number.
+    Phone,
+    /// Number.
+    Number,
+    /// Calendar date.
+    Date,
+    /// Payment card number.
+    CardNumber,
+    /// Expiration date (MM/YY).
+    Expiry,
+    /// Card verification value.
+    Cvv,
+    /// PIN.
+    Pin,
+    /// Hash / checksum.
+    Hash,
+    /// Key material (API key, SSH key, ...).
+    Key,
+    /// `.env`-style variables.
+    Env,
+}
+
+impl InputKind {
+    /// Every input type a user can choose, in display order.
+    pub const ALL: [InputKind; 16] = [
+        Self::Text,
+        Self::Password,
+        Self::SecureNote,
+        Self::Totp,
+        Self::Url,
+        Self::Email,
+        Self::Phone,
+        Self::Number,
+        Self::Date,
+        Self::CardNumber,
+        Self::Expiry,
+        Self::Cvv,
+        Self::Pin,
+        Self::Hash,
+        Self::Key,
+        Self::Env,
+    ];
+
+    /// Stable storage identifier.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Password => "password",
+            Self::SecureNote => "secure_note",
+            Self::Totp => "totp",
+            Self::Url => "url",
+            Self::Email => "email",
+            Self::Phone => "phone",
+            Self::Number => "number",
+            Self::Date => "date",
+            Self::CardNumber => "card_number",
+            Self::Expiry => "expiry",
+            Self::Cvv => "cvv",
+            Self::Pin => "pin",
+            Self::Hash => "hash",
+            Self::Key => "key",
+            Self::Env => "env",
+        }
+    }
+
+    /// Parse a storage identifier; unknown identifiers are [`Error::InvalidInput`].
+    pub fn parse(s: &str) -> Result<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|k| k.as_str() == s)
+            .ok_or(Error::InvalidInput)
+    }
+
+    /// Whether values of this type are secret (hidden by default) unless overridden.
+    pub fn secret_by_default(self) -> bool {
+        matches!(
+            self,
+            Self::Password
+                | Self::SecureNote
+                | Self::Totp
+                | Self::CardNumber
+                | Self::Cvv
+                | Self::Pin
+                | Self::Hash
+                | Self::Key
+                | Self::Env
+        )
+    }
+}
+
+/// One input of a category's form template. Items created in the category start with one
+/// [`ItemField`] per live category field.
+///
+/// `is_core` inputs are required by the category's logic (e.g. a card's number, expiry and CVV):
+/// they can be renamed or reordered but never deleted, and their `kind` and secrecy are fixed.
+/// Users can add any number of extra (non-core) inputs to any category.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct CategoryField {
+    /// Field id. Preset fields use deterministic ids (`preset:<preset>:<key>`) so devices that
+    /// seed independently converge on the same records.
+    pub id: String,
+    /// Owning category.
+    pub category_id: String,
+    /// Display name.
+    pub name: String,
+    /// Input type, an [`InputKind`] storage identifier.
+    pub kind: String,
+    /// Whether values are secret (hidden by default).
+    pub is_secret: bool,
+    /// Protected core input: cannot be deleted.
+    pub is_core: bool,
+    /// Display order.
+    pub sort_order: i64,
     /// Last modification time, Unix ms UTC.
     pub updated_at: i64,
     /// Device id of the last writer.
@@ -381,6 +522,8 @@ pub struct Snapshot {
     pub vault_meta: Vec<VaultMeta>,
     /// Categories.
     pub categories: Vec<Category>,
+    /// Category form templates (inputs).
+    pub category_fields: Vec<CategoryField>,
     /// Tags.
     pub tags: Vec<Tag>,
     /// Items (with password history).
