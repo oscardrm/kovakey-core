@@ -1,1 +1,7 @@
-vault-core: Es el núcleo principal. Aquí vive el 100% de la lógica de negocio pura: el cifrado (AES-256 / Argon2id), el manejo de la base de datos local (SQLCipher), el generador de contraseñas, las notas y el motor de sincronización. No sabe nada de interfaces gráficas; solo procesa datos de forma segura.
+# TrueVault Core
+
+`vault-core` is the core cryptographic and synchronization engine for TrueVault. It contains zero UI logic and handles:
+- AES-GCM encrypted `.vault` blobs and versioned snapshot serialization.
+- Local SQLite / SQLCipher persistence and portable in-memory store (`MemStore`).
+- Conflict resolution, snapshot merging (Last-writer-wins with deterministic tie-breaks), and side-blob deduplication.
+- Password generation, TOTP, and secure memory zeroization.
