@@ -91,6 +91,28 @@ fn balanced(t: &str) -> bool {
     depth == 0 && !in_str
 }
 
+/// `import os` / `import a.b as c` / `from x import y, z` without quotes or semicolons (so not JS).
+fn is_python_import(l: &str) -> bool {
+    let ident = |w: &str| {
+        !w.is_empty()
+            && w.chars()
+                .all(|c| c.is_alphanumeric() || c == '_' || c == '.')
+    };
+    if let Some(rest) = l.strip_prefix("import ") {
+        let module = rest.split(" as ").next().unwrap_or("");
+        return module.split(',').all(|m| ident(m.trim()));
+    }
+    if let Some(rest) = l.strip_prefix("from ") {
+        if let Some((module, names)) = rest.split_once(" import ") {
+            return ident(module.trim())
+                && names.split(',').all(|n| {
+                    ident(n.trim().trim_matches(|c| c == '(' || c == ')')) || n.trim() == "*"
+                });
+        }
+    }
+    false
+}
+
 /// Detect the most likely language of `code`.
 pub fn detect_language(code: &str) -> Language {
     let t = code.trim();
@@ -159,6 +181,9 @@ pub fn detect_language(code: &str) -> Language {
             && !l.ends_with(';')
         {
             score[1] += 1;
+        }
+        if is_python_import(l) {
+            score[1] += 2;
         }
         if l.ends_with(':')
             && (low.starts_with("def ")
@@ -235,6 +260,12 @@ mod tests {
     }
 
     #[test]
+    fn js_imports_are_not_mistaken_for_python() {
+        assert_eq!(detect_language("import x from 'x';"), Language::JavaScript);
+        assert_eq!(detect_language("import os"), Language::Python);
+    }
+
+    #[test]
     fn invalid_json_is_not_reported_as_json() {
         assert_ne!(detect_language("{\"a\": [1, 2}"), Language::Json);
     }
@@ -270,5 +301,38 @@ mod tests {
     fn detection_is_deterministic() {
         let s = "echo hi\ncd /";
         assert_eq!(detect_language(s), detect_language(s));
+    }
+
+    #[test]
+    fn detects_realistic_samples_for_every_supported_language() {
+        let cases: &[(&str, Language)] = &[
+            ("{\n  \"name\": \"app\",\n  \"version\": \"1.0.0\",\n  \"private\": true\n}", Language::Json),
+            ("{\"a\": null}", Language::Json),
+            ("[1, 2, 3]", Language::Json),
+            ("select * from users", Language::Sql),
+            ("SELECT u.id, COUNT(*) AS n\nFROM users u\nJOIN orders o ON o.uid = u.id\nGROUP BY u.id\nORDER BY n DESC;", Language::Sql),
+            ("UPDATE users SET name = 'x' WHERE id = 1;", Language::Sql),
+            ("INSERT INTO t (a, b) VALUES (1, 2);", Language::Sql),
+            ("WITH x AS (SELECT 1) SELECT * FROM x;", Language::Sql),
+            ("const add = (a, b) => a + b;\nexport default add;", Language::JavaScript),
+            ("import { ref } from 'vue';\nconst n = ref(0);", Language::JavaScript),
+            ("let x = 5\nfunction go() {\n  console.log(x)\n}", Language::JavaScript),
+            ("import os\nimport sys\n\ndef main():\n    print(os.getcwd())\n\nif __name__ == '__main__':\n    main()", Language::Python),
+            ("class A:\n    def __init__(self):\n        self.x = None", Language::Python),
+            ("from typing import List\n\nx: List[int] = [1]", Language::Python),
+            ("for i in range(3):\n    print(i)", Language::Python),
+            ("#!/usr/bin/env bash\nset -e\necho hi", Language::Bash),
+            ("#!/bin/sh\nls -la", Language::Bash),
+            ("export PATH=$PATH:/opt/bin\ncurl -s https://x.io | grep ok", Language::Bash),
+            ("if [ -f x ]; then\n  echo yes\nfi", Language::Bash),
+            ("$ ls -la\n$ cd /tmp", Language::Bash),
+            ("version: '3'\nservices:\n  web:\n    image: nginx\n    ports:\n      - \"80:80\"", Language::Yaml),
+            ("---\nkey: value\nother: 2", Language::Yaml),
+            ("- name: install\n  apt: name=git\n- name: copy\n  copy: src=a dest=b", Language::Yaml),
+            ("hello world, this is a note.\nBuy milk: 2 liters", Language::PlainText),
+        ];
+        for (code, expected) in cases {
+            assert_eq!(detect_language(code), *expected, "{code}");
+        }
     }
 }
