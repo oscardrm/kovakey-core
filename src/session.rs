@@ -8,7 +8,7 @@
 //! Storage is pluggable ([`VaultStore`]): SQLCipher on native targets, [`crate::mem_store::MemStore`]
 //! everywhere. Time is injected per call (`now_ms`), never read here.
 
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::error::{Error, Result};
 use crate::keys::{DeviceEnrollment, DeviceKey, VaultHeader, VaultKeys};
@@ -27,6 +27,20 @@ pub struct TotpCode {
     pub seconds_remaining: u64,
     /// Time step in seconds.
     pub period: u64,
+}
+
+/// Strength of one item's password. See [`Session::password_strengths`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct PasswordStrength {
+    /// Item id.
+    pub item_id: String,
+    /// Estimated entropy in bits (before the reuse demotion).
+    pub bits: f64,
+    /// Level, demoted one step when `reused`.
+    pub level: crate::generator::Strength,
+    /// The same password is used by another item.
+    pub reused: bool,
+    key: String,
 }
 
 struct Unlocked<S> {
@@ -181,6 +195,42 @@ impl<S: VaultStore> Session<S> {
     /// Search, filter and sort live items (non-secret fields only).
     pub fn search(&self, filter: &ItemFilter) -> Result<Vec<crate::ops::ItemSummary>> {
         Ok(filter_items(self.store()?.list_items()?, filter))
+    }
+
+    /// Strength of every live item's primary password (first `password` field), computed locally.
+    /// Passwords shared by several items are marked `reused` and demoted one level. The result
+    /// holds no password material.
+    pub fn password_strengths(&self) -> Result<Vec<PasswordStrength>> {
+        let store = self.store()?;
+        let mut out: Vec<PasswordStrength> = Vec::new();
+        let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for summary in store.list_items()? {
+            let detail = store.get_item(&summary.id)?;
+            let Some(field) = detail.fields.iter().find(|f| f.kind == "password") else {
+                continue;
+            };
+            let pw = store.reveal_field(&summary.id, &field.id)?;
+            if pw.is_empty() {
+                continue;
+            }
+            let report = crate::strength::analyze(&pw);
+            *seen.entry(pw.to_string()).or_default() += 1;
+            out.push(PasswordStrength {
+                item_id: summary.id,
+                bits: report.bits,
+                level: report.level,
+                reused: false,
+                key: pw.to_string(),
+            });
+        }
+        for p in &mut out {
+            if seen.get(&p.key).copied().unwrap_or(0) > 1 {
+                p.reused = true;
+                p.level = crate::strength::demote(p.level);
+            }
+            p.key.zeroize();
+        }
+        Ok(out)
     }
 
     /// Current TOTP code of a `totp` field. The field holds a Base32 secret or an `otpauth://`
@@ -600,6 +650,21 @@ mod tests {
         );
         assert!(s.totp_code(&id, &fields[2].id, 59).is_err());
         assert_eq!(s.totp_code(&id, "nope", 59).err(), Some(Error::NotFound));
+    }
+
+    #[test]
+    fn password_strengths_flag_reuse_and_weakness() {
+        let (mut s, _) = new_mem();
+        let a = add_login(&mut s, 10, "A", "123456");
+        let b = add_login(&mut s, 20, "B", "vT9#kLq2$Zw8!mXc4Rp7");
+        let c = add_login(&mut s, 30, "C", "vT9#kLq2$Zw8!mXc4Rp7");
+        let r = s.password_strengths().unwrap();
+        let get = |id: &str| r.iter().find(|p| p.item_id == id).unwrap();
+        assert_eq!(get(&a).level, crate::generator::Strength::VeryWeak);
+        assert!(!get(&a).reused);
+        assert!(get(&b).reused && get(&c).reused);
+        assert_eq!(get(&b).level, crate::generator::Strength::Strong);
+        assert!(r.iter().all(|p| p.key.is_empty()));
     }
 
     #[test]
