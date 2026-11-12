@@ -6,6 +6,11 @@
 //! Recovery Key    --HKDF------> KEK_rk  --wraps--/        |-- HKDF --> DB key (SQLCipher raw key)
 //! ```
 //!
+//! Optional **device wrap** (quick unlock, ADR 0003): a random per-device [`DeviceKey`] wraps the
+//! data key into a 60-byte blob that is stored *device-locally* (never in the header or the synced
+//! `.vault`). The host keeps the `DeviceKey` in hardware-protected storage (Keychain/Keystore,
+//! biometric-gated). The data key itself never leaves this crate.
+//!
 //! Header layout (fixed 169 bytes, format version 1):
 //! `magic "TVLT" | version u8 | vault_id[16] | kdf_params[28] | wrapped_by_pw[60] | wrapped_by_rk[60]`.
 //! Each wrap is AES-256-GCM with AAD binding magic, version, vault id, purpose (and KDF params
@@ -24,6 +29,44 @@ const WRAPPED_LEN: usize = NONCE_LEN + KEY_LEN + TAG_LEN;
 /// Total serialized header size.
 pub const HEADER_LEN: usize = 4 + 1 + ID_LEN + PARAMS_LEN + WRAPPED_LEN * 2;
 const DB_KEY_LABEL: &[u8] = b"truevault/db-key/v1";
+
+/// A random per-device key that unwraps the data key from a device-local wrap blob.
+/// Zeroized on drop; `Debug` is redacted; not `Clone`.
+pub struct DeviceKey(SecretKey);
+
+impl DeviceKey {
+    /// Generate a fresh random device key from the OS CSPRNG.
+    pub fn generate() -> Result<Self> {
+        Ok(Self(SecretKey::random()?))
+    }
+
+    /// Rebuild from the bytes previously handed to the host. Wrong length is an error.
+    pub fn from_slice(bytes: &[u8]) -> Result<Self> {
+        let arr: [u8; KEY_LEN] = bytes.try_into().map_err(|_| Error::Decryption)?;
+        Ok(Self(SecretKey::from_bytes(arr)))
+    }
+
+    /// Borrow the raw bytes (for handing to the host's secure storage exactly once).
+    pub fn expose(&self) -> &[u8; KEY_LEN] {
+        self.0.expose()
+    }
+}
+
+impl core::fmt::Debug for DeviceKey {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("DeviceKey(<redacted>)")
+    }
+}
+
+/// Result of device enrollment: the key for secure storage and the device-local wrap blob.
+#[derive(Debug)]
+pub struct DeviceEnrollment {
+    /// Store in hardware-protected, biometric-gated storage; never sync, never log.
+    pub device_key: DeviceKey,
+    /// Opaque wrap (`nonce || ciphertext || tag`, [`WRAPPED_LEN`] bytes). Not secret on its own;
+    /// store device-locally next to the header.
+    pub wrapped: Vec<u8>,
+}
 
 /// Parsed vault header (contains no plaintext secrets).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -119,6 +162,36 @@ impl VaultHeader {
             &self.wrapped_by_recovery,
             &aad(&self.vault_id, b"rk", &[]),
         )
+    }
+
+    /// Enroll this device for quick unlock: generate a [`DeviceKey`] and wrap the data key with it.
+    /// The AAD binds magic, format version, vault id and the purpose `"dev"` (not the device id,
+    /// so the wrap survives a device-id change). Callers must authenticate the user first.
+    pub fn enroll_device(&self, keys: &VaultKeys) -> Result<DeviceEnrollment> {
+        let device_key = DeviceKey::generate()?;
+        let wrapped = wrap(
+            &device_key.0,
+            &keys.data_key,
+            &aad(&self.vault_id, b"dev", &[]),
+        )?;
+        Ok(DeviceEnrollment {
+            device_key,
+            wrapped: wrapped.to_vec(),
+        })
+    }
+
+    /// Unlock with a device key and its wrap blob. Every failure (wrong key, tampering, wrong
+    /// vault, bad length) is the same [`Error::Decryption`].
+    pub fn unlock_with_device_key(
+        &self,
+        device_key: &DeviceKey,
+        wrapped: &[u8],
+    ) -> Result<VaultKeys> {
+        if wrapped.len() != WRAPPED_LEN {
+            return Err(Error::Decryption);
+        }
+        unwrap_key(&device_key.0, wrapped, &aad(&self.vault_id, b"dev", &[]))
+            .map_err(|_| Error::Decryption)
     }
 
     /// Forgotten-password flow: prove possession of the Recovery Key and set a new Master
@@ -248,6 +321,119 @@ mod tests {
         );
         assert!(h2.unlock_with_recovery(&r).is_ok());
         assert_ne!(h2.kdf, h.kdf);
+    }
+
+    #[test]
+    fn device_wrap_round_trips_to_the_same_data_key() {
+        let (h, k, _) = new_vault();
+        let e = h.enroll_device(&k).unwrap();
+        assert_eq!(e.wrapped.len(), WRAPPED_LEN);
+        let keys = h.unlock_with_device_key(&e.device_key, &e.wrapped).unwrap();
+        assert_eq!(keys.data_key().expose(), k.data_key().expose());
+    }
+
+    #[test]
+    fn device_wrap_does_not_contain_the_data_key() {
+        let (h, k, _) = new_vault();
+        let e = h.enroll_device(&k).unwrap();
+        let dk = k.data_key().expose();
+        assert!(!e.wrapped.windows(dk.len()).any(|w| w == dk));
+        assert!(!e
+            .wrapped
+            .windows(KEY_LEN)
+            .any(|w| w == e.device_key.expose()));
+    }
+
+    #[test]
+    fn each_enrollment_uses_a_fresh_key_and_nonce() {
+        let (h, k, _) = new_vault();
+        let (a, b) = (h.enroll_device(&k).unwrap(), h.enroll_device(&k).unwrap());
+        assert_ne!(a.device_key.expose(), b.device_key.expose());
+        assert_ne!(a.wrapped, b.wrapped);
+        // A wrap only opens with its own key.
+        assert!(h.unlock_with_device_key(&a.device_key, &b.wrapped).is_err());
+    }
+
+    #[test]
+    fn wrong_device_key_fails() {
+        let (h, k, _) = new_vault();
+        let e = h.enroll_device(&k).unwrap();
+        let other = DeviceKey::generate().unwrap();
+        assert_eq!(
+            h.unlock_with_device_key(&other, &e.wrapped).unwrap_err(),
+            Error::Decryption
+        );
+    }
+
+    #[test]
+    fn tampering_with_any_wrap_byte_fails() {
+        let (h, k, _) = new_vault();
+        let e = h.enroll_device(&k).unwrap();
+        for i in 0..e.wrapped.len() {
+            let mut t = e.wrapped.clone();
+            t[i] ^= 0x01;
+            assert_eq!(
+                h.unlock_with_device_key(&e.device_key, &t).unwrap_err(),
+                Error::Decryption,
+                "byte {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn truncated_or_extended_wrap_fails() {
+        let (h, k, _) = new_vault();
+        let e = h.enroll_device(&k).unwrap();
+        for len in [0, 1, WRAPPED_LEN - 1] {
+            assert!(h
+                .unlock_with_device_key(&e.device_key, &e.wrapped[..len])
+                .is_err());
+        }
+        let mut longer = e.wrapped.clone();
+        longer.push(0);
+        assert!(h.unlock_with_device_key(&e.device_key, &longer).is_err());
+    }
+
+    #[test]
+    fn wrap_from_another_vault_is_rejected_even_with_its_device_key() {
+        let (h_a, k_a, _) = new_vault();
+        let (h_b, _, _) = new_vault();
+        let e = h_a.enroll_device(&k_a).unwrap();
+        // Same key + blob presented to a different vault: the vault id in the AAD must not match.
+        assert!(h_b
+            .unlock_with_device_key(&e.device_key, &e.wrapped)
+            .is_err());
+    }
+
+    #[test]
+    fn password_wrap_cannot_be_replayed_as_a_device_wrap() {
+        // Purpose binding: the "pw" wrap under some key must not open as a "dev" wrap.
+        let (h, k, _) = new_vault();
+        let kek = h.kdf.derive_kek(PW).unwrap();
+        let as_device = DeviceKey::from_slice(kek.expose()).unwrap();
+        assert!(h
+            .unlock_with_device_key(&as_device, &h.wrapped_by_password)
+            .is_err());
+        let _ = k;
+    }
+
+    #[test]
+    fn device_wrap_survives_password_change_and_reset() {
+        let (h, k, r) = new_vault();
+        let e = h.enroll_device(&k).unwrap();
+        let h2 = h.change_password(&k, b"new-fake-pass").unwrap();
+        assert!(h2.unlock_with_device_key(&e.device_key, &e.wrapped).is_ok());
+        let h3 = h2.reset_password(&r, b"newer-fake-pass").unwrap();
+        assert!(h3.unlock_with_device_key(&e.device_key, &e.wrapped).is_ok());
+    }
+
+    #[test]
+    fn device_key_debug_is_redacted_and_length_is_checked() {
+        let k = DeviceKey::generate().unwrap();
+        assert_eq!(format!("{k:?}"), "DeviceKey(<redacted>)");
+        assert!(DeviceKey::from_slice(&[0u8; 31]).is_err());
+        assert!(DeviceKey::from_slice(&[0u8; 33]).is_err());
+        assert!(DeviceKey::from_slice(&[]).is_err());
     }
 
     #[test]

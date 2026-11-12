@@ -11,7 +11,7 @@
 use zeroize::Zeroizing;
 
 use crate::error::{Error, Result};
-use crate::keys::{VaultHeader, VaultKeys};
+use crate::keys::{DeviceEnrollment, DeviceKey, VaultHeader, VaultKeys};
 use crate::ops::{non_empty, VaultStore, WriteCtx};
 use crate::recovery::RecoveryKey;
 use crate::search::{filter_items, ItemFilter};
@@ -94,6 +94,32 @@ impl<S: VaultStore> Session<S> {
     ) -> Result<Self> {
         let keys = header.unlock_with_recovery(&RecoveryKey::parse(recovery_key)?)?;
         Self::new(device_id, header.clone(), keys, true, make_store)
+    }
+
+    /// Unlock with a device key and its device-local wrap (quick unlock, ADR 0003).
+    /// Any failure is [`Error::Decryption`]; the host should then disable quick unlock and fall
+    /// back to the Master Password.
+    pub fn unlock_with_device_key(
+        header: &VaultHeader,
+        device_key: &DeviceKey,
+        wrapped: &[u8],
+        device_id: &str,
+        make_store: impl FnOnce(&VaultKeys) -> Result<S>,
+    ) -> Result<Self> {
+        let keys = header.unlock_with_device_key(device_key, wrapped)?;
+        Self::new(device_id, header.clone(), keys, false, make_store)
+    }
+
+    /// Enroll this device for quick unlock. Re-verifies the Master Password (skipped when the
+    /// session was unlocked with the Recovery Key, like [`Session::change_password`]) so a
+    /// session left unlocked cannot silently enable biometric access. Returns the device key
+    /// (for hardware-protected storage) and the wrap blob (device-local file).
+    pub fn enroll_device_unlock(&self, current_password: &str) -> Result<DeviceEnrollment> {
+        let st = self.state.as_ref().ok_or(Error::Locked)?;
+        if !self.via_recovery {
+            self.header.unlock(current_password.as_bytes())?;
+        }
+        self.header.enroll_device(&st.keys)
     }
 
     /// `true` once [`Session::lock`] has been called.
@@ -288,6 +314,85 @@ mod tests {
             .iter()
             .map(|b| (b.name.clone(), b.sealed.clone()))
             .collect()
+    }
+
+    #[test]
+    fn device_unlock_round_trip_preserves_data_and_requires_password_to_enroll() {
+        let (header, keys, _) =
+            VaultHeader::create_with(PW.as_bytes(), KdfParams::for_tests()).unwrap();
+        let mut s = Session::new(
+            "dev-a",
+            header.clone(),
+            keys,
+            false,
+            |_| Ok(MemStore::new()),
+        )
+        .unwrap();
+        // Wrong or empty password cannot enroll.
+        assert_eq!(
+            s.enroll_device_unlock("wrong").err(),
+            Some(Error::Decryption)
+        );
+        assert_eq!(s.enroll_device_unlock("").err(), Some(Error::Decryption));
+        let e = s.enroll_device_unlock(PW).unwrap();
+        assert_eq!(e.wrapped.len(), 60);
+        add_login(&mut s, 10, "Mail", "fake-secret");
+        s.lock();
+
+        // Unlock without the password; the store is rebuilt by the host from the same keys.
+        let s2 =
+            Session::unlock_with_device_key(&header, &e.device_key, &e.wrapped, "dev-a", |k| {
+                // MemStore is not persistent; a successful key unwrap + store build is what we assert.
+                assert!(k.db_key().is_ok());
+                Ok(MemStore::new())
+            })
+            .unwrap();
+        assert!(!s2.is_locked());
+        // A device-unlocked session is not "via recovery": enrolling again needs the password.
+        assert_eq!(
+            s2.enroll_device_unlock("wrong").err(),
+            Some(Error::Decryption)
+        );
+    }
+
+    #[test]
+    fn device_unlock_with_bad_key_or_wrap_fails_with_decryption() {
+        let (header, keys, _) =
+            VaultHeader::create_with(PW.as_bytes(), KdfParams::for_tests()).unwrap();
+        let s = Session::new(
+            "dev-a",
+            header.clone(),
+            keys,
+            false,
+            |_| Ok(MemStore::new()),
+        )
+        .unwrap();
+        let e = s.enroll_device_unlock(PW).unwrap();
+        let bad = DeviceKey::generate().unwrap();
+        let r = Session::<MemStore>::unlock_with_device_key(&header, &bad, &e.wrapped, "d", |_| {
+            Ok(MemStore::new())
+        });
+        assert_eq!(r.err(), Some(Error::Decryption));
+    }
+
+    #[test]
+    fn enrolling_requires_an_unlocked_session() {
+        let (mut s, _) = new_mem();
+        s.lock();
+        assert_eq!(s.enroll_device_unlock(PW).err(), Some(Error::Locked));
+    }
+
+    #[test]
+    fn recovery_unlocked_session_can_enroll_without_the_old_password() {
+        let (header, keys, recovery) =
+            VaultHeader::create_with(PW.as_bytes(), KdfParams::for_tests()).unwrap();
+        drop(keys);
+        let s =
+            Session::unlock_with_recovery(&header, &recovery.to_display_string(), "dev-a", |_| {
+                Ok(MemStore::new())
+            })
+            .unwrap();
+        assert!(s.enroll_device_unlock("").is_ok());
     }
 
     #[test]
