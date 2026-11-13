@@ -31,6 +31,20 @@ pub struct TotpCode {
     pub period: u64,
 }
 
+/// Local Security Audit result (PRD §9.2). Ids only; no password material.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AuditReport {
+    /// Items whose primary password is `VeryWeak` or `Weak` by entropy (before any reuse demotion).
+    pub weak: Vec<String>,
+    /// Groups of items sharing the same primary password.
+    pub reused: Vec<Vec<String>>,
+    /// Items with a password not modified for at least the requested number of days
+    /// (`updated_at` is the proxy for "password last changed").
+    pub old: Vec<String>,
+    /// Credential items with a password and a URL but no `totp` field.
+    pub missing_2fa: Vec<String>,
+}
+
 /// Strength of one item's password. See [`Session::password_strengths`].
 #[derive(Clone, Debug, PartialEq)]
 pub struct PasswordStrength {
@@ -280,6 +294,50 @@ impl<S: VaultStore> Session<S> {
             p.key.zeroize();
         }
         Ok(out)
+    }
+
+    /// Local Security Audit: weak, reused, old and missing-2FA items, computed in memory with no
+    /// network access. `old_after_days` is the age threshold for `old`; `now_ms` is Unix ms UTC.
+    pub fn security_audit(&self, now_ms: i64, old_after_days: u32) -> Result<AuditReport> {
+        use crate::generator::Strength;
+        let strengths = self.password_strengths()?;
+        let with_password: std::collections::HashSet<&str> =
+            strengths.iter().map(|p| p.item_id.as_str()).collect();
+        let mut report = AuditReport {
+            weak: strengths
+                .iter()
+                .filter(|p| {
+                    matches!(
+                        crate::generator::strength_from_bits(p.bits),
+                        Strength::VeryWeak | Strength::Weak
+                    )
+                })
+                .map(|p| p.item_id.clone())
+                .collect(),
+            reused: self.password_reuse_groups()?,
+            ..AuditReport::default()
+        };
+        let cutoff = now_ms.saturating_sub(i64::from(old_after_days).saturating_mul(86_400_000));
+        let store = self.store()?;
+        for summary in store.list_items()? {
+            if !with_password.contains(summary.id.as_str()) {
+                continue;
+            }
+            if summary.updated_at <= cutoff {
+                report.old.push(summary.id.clone());
+            }
+            if summary.item_type == crate::models::ItemType::Credential
+                && summary.url.as_deref().is_some_and(|u| !u.trim().is_empty())
+                && !store
+                    .get_item(&summary.id)?
+                    .fields
+                    .iter()
+                    .any(|f| f.kind == "totp")
+            {
+                report.missing_2fa.push(summary.id);
+            }
+        }
+        Ok(report)
     }
 
     /// Groups of live items whose primary password (first `password` field) is identical.
@@ -808,6 +866,46 @@ mod tests {
         want_2.sort();
         assert_eq!(g.len(), 2);
         assert!(g.contains(&want_1) && g.contains(&want_2));
+    }
+
+    #[test]
+    fn security_audit_reports_weak_reused_old_and_missing_2fa() {
+        let (mut s, _) = new_mem();
+        let day = 86_400_000i64;
+        let weak = add_login(&mut s, 0, "Weak", "123456");
+        let strong = add_login(&mut s, 100 * day, "Strong", "vT9#kLq2$Zw8!mXc4Rp7");
+        let dup = add_login(&mut s, 100 * day, "Dup", "vT9#kLq2$Zw8!mXc4Rp7");
+        let with_2fa = s
+            .write(100 * day, |st, ctx| {
+                let mut n = NewItem::new(ItemType::Credential, "Bank");
+                n.url = Some("https://bank.example".into());
+                n.fields = vec![
+                    FieldInput::new("password", "password", "q8#Zr!pL2$vN7&xKd4Wm", true),
+                    FieldInput::new("2FA", "totp", "JBSWY3DPEHPK3PXP", true),
+                ];
+                st.create_item(ctx, &n)
+            })
+            .unwrap();
+        let no_2fa = s
+            .write(100 * day, |st, ctx| {
+                let mut n = NewItem::new(ItemType::Credential, "Shop");
+                n.url = Some("https://shop.example".into());
+                n.fields = vec![FieldInput::new(
+                    "password",
+                    "password",
+                    "m4$Tz!qW9#bXr2&Lc7Pn",
+                    true,
+                )];
+                st.create_item(ctx, &n)
+            })
+            .unwrap();
+        let r = s.security_audit(100 * day, 90).unwrap();
+        assert_eq!(r.weak, vec![weak.clone()]);
+        assert_eq!(r.old, vec![weak]);
+        assert_eq!(r.reused.len(), 1);
+        assert!(r.reused[0].contains(&strong) && r.reused[0].contains(&dup));
+        assert_eq!(r.missing_2fa, vec![no_2fa]);
+        assert!(!r.missing_2fa.contains(&with_2fa));
     }
 
     #[test]
