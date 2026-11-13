@@ -282,6 +282,36 @@ impl<S: VaultStore> Session<S> {
         Ok(out)
     }
 
+    /// Groups of live items whose primary password (first `password` field) is identical.
+    /// Only groups of two or more items are returned, each sorted by item id and the groups
+    /// ordered by their first id. The result holds item ids only, never password material.
+    pub fn password_reuse_groups(&self) -> Result<Vec<Vec<String>>> {
+        let store = self.store()?;
+        let mut by_pw: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        for summary in store.list_items()? {
+            let detail = store.get_item(&summary.id)?;
+            let Some(field) = detail.fields.iter().find(|f| f.kind == "password") else {
+                continue;
+            };
+            let pw = store.reveal_field(&summary.id, &field.id)?;
+            if pw.is_empty() {
+                continue;
+            }
+            by_pw.entry(pw.to_string()).or_default().push(summary.id);
+        }
+        let mut groups: Vec<Vec<String>> = Vec::new();
+        for (mut key, mut ids) in by_pw {
+            key.zeroize();
+            if ids.len() > 1 {
+                ids.sort();
+                groups.push(ids);
+            }
+        }
+        groups.sort();
+        Ok(groups)
+    }
+
     /// Current TOTP code of a `totp` field. The field holds a Base32 secret or an `otpauth://`
     /// URI; the secret itself never leaves the session.
     pub fn totp_code(&self, item_id: &str, field_id: &str, unix_secs: u64) -> Result<TotpCode> {
@@ -758,6 +788,34 @@ mod tests {
         assert!(get(&b).reused && get(&c).reused);
         assert_eq!(get(&b).level, crate::generator::Strength::Strong);
         assert!(r.iter().all(|p| p.key.is_empty()));
+    }
+
+    #[test]
+    fn password_reuse_groups_lists_only_shared_passwords() {
+        let (mut s, _) = new_mem();
+        let a = add_login(&mut s, 10, "A", "123456");
+        let b = add_login(&mut s, 20, "B", "vT9#kLq2$Zw8!mXc4Rp7");
+        let c = add_login(&mut s, 30, "C", "vT9#kLq2$Zw8!mXc4Rp7");
+        let d = add_login(&mut s, 40, "D", "vT9#kLq2$Zw8!mXc4Rp7");
+        let e = add_login(&mut s, 50, "E", "123456");
+        let mut g = s.password_reuse_groups().unwrap();
+        for grp in &mut g {
+            grp.sort();
+        }
+        let mut want_1 = vec![a, e];
+        want_1.sort();
+        let mut want_2 = vec![b, c, d];
+        want_2.sort();
+        assert_eq!(g.len(), 2);
+        assert!(g.contains(&want_1) && g.contains(&want_2));
+    }
+
+    #[test]
+    fn password_reuse_groups_empty_without_reuse() {
+        let (mut s, _) = new_mem();
+        add_login(&mut s, 10, "A", "123456");
+        add_login(&mut s, 20, "B", "vT9#kLq2$Zw8!mXc4Rp7");
+        assert!(s.password_reuse_groups().unwrap().is_empty());
     }
 
     #[test]
