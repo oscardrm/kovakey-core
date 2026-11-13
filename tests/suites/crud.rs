@@ -322,6 +322,49 @@ fn create_tag_returns_the_existing_live_tag_with_the_same_name() {
     assert_eq!(d.list_tags().unwrap().len(), 1);
 }
 
+#[test]
+fn update_tag_renames_and_recolors_and_items_follow() {
+    let mut d = db();
+    let id = login(&mut d, "dev-a", 100, "My Bank", "fake");
+    let bank = d.list_tags().unwrap().into_iter().find(|t| t.name == "#bank").unwrap();
+    let t = d
+        .update_tag(&ctx("dev-a", 200), &bank.id, Some("#money"), Some("#123456"))
+        .unwrap();
+    assert_eq!((t.name.as_str(), t.color.as_str()), ("#money", "#123456"));
+    assert!(t.updated_at > bank.updated_at);
+    assert!(tags_of(&d, &id).contains(&"#money".to_string()));
+    assert!(!tags_of(&d, &id).contains(&"#bank".to_string()));
+    // Color-only update keeps the name.
+    let t = d.update_tag(&ctx("dev-a", 300), &bank.id, None, Some("#abcdef")).unwrap();
+    assert_eq!((t.name.as_str(), t.color.as_str()), ("#money", "#abcdef"));
+}
+
+#[test]
+fn update_tag_rejects_empty_duplicate_and_missing() {
+    let mut d = db();
+    let a = d.create_tag(&ctx("dev-a", 100), "#a", "#111111").unwrap();
+    let b = d.create_tag(&ctx("dev-a", 110), "#b", "#222222").unwrap();
+    assert!(matches!(
+        d.update_tag(&ctx("dev-a", 200), &a.id, Some("  "), None),
+        Err(Error::InvalidInput)
+    ));
+    assert!(matches!(
+        d.update_tag(&ctx("dev-a", 200), &a.id, Some("#b"), None),
+        Err(Error::InvalidInput)
+    ));
+    assert!(matches!(
+        d.update_tag(&ctx("dev-a", 200), "missing", Some("#x"), None),
+        Err(Error::NotFound)
+    ));
+    // Renaming to its own name is fine; a deleted tag cannot be edited.
+    d.update_tag(&ctx("dev-a", 210), &a.id, Some("#a"), None).unwrap();
+    d.delete_tag(&ctx("dev-a", 220), &b.id).unwrap();
+    assert!(matches!(
+        d.update_tag(&ctx("dev-a", 230), &b.id, Some("#c"), None),
+        Err(Error::NotFound)
+    ));
+}
+
 // ---- usage counters ---------------------------------------------------------------------
 
 #[test]

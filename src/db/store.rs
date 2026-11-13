@@ -787,6 +787,45 @@ impl Database {
         ids.iter().map(|id| read_tag(self.conn(), id)).collect()
     }
 
+    /// Rename and/or recolor a live tag; item links are untouched.
+    pub fn update_tag(
+        &mut self,
+        ctx: &WriteCtx<'_>,
+        tag_id: &str,
+        name: Option<&str>,
+        color: Option<&str>,
+    ) -> Result<Tag> {
+        if let Some(n) = name {
+            non_empty(n)?;
+        }
+        let tx = self.begin(ctx)?;
+        let tag = read_tag(&tx, tag_id)?;
+        if tag.deleted_at.is_some() {
+            return Err(Error::NotFound);
+        }
+        let new_name = name.unwrap_or(&tag.name);
+        let clash: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM tags WHERE name=?1 AND id<>?2 AND deleted_at IS NULL)",
+                params![new_name, tag_id],
+                |r| r.get(0),
+            )
+            .map_err(db_err)?;
+        if clash {
+            return Err(Error::InvalidInput);
+        }
+        let new_color = color.unwrap_or(&tag.color);
+        let t = bump(tag.updated_at, ctx.now_ms);
+        tx.execute(
+            "UPDATE tags SET name=?2,color=?3,updated_at=?4,updated_by=?5 WHERE id=?1",
+            params![tag_id, new_name, new_color, t, ctx.device_id],
+        )
+        .map_err(db_err)?;
+        let updated = read_tag(&tx, tag_id)?;
+        tx.commit().map_err(db_err)?;
+        Ok(updated)
+    }
+
     /// Delete a tag and all its links (tombstones).
     pub fn delete_tag(&mut self, ctx: &WriteCtx<'_>, tag_id: &str) -> Result<()> {
         let tx = self.begin(ctx)?;
@@ -1197,6 +1236,7 @@ impl VaultStore for Database {
         fn reveal_password_history(&Self, item_id: &str) -> Result<Vec<HistoryEntry>>;
         fn create_tag(&mut Self, ctx: &WriteCtx<'_>, name: &str, color: &str) -> Result<Tag>;
         fn list_tags(&Self) -> Result<Vec<Tag>>;
+        fn update_tag(&mut Self, ctx: &WriteCtx<'_>, tag_id: &str, name: Option<&str>, color: Option<&str>) -> Result<Tag>;
         fn delete_tag(&mut Self, ctx: &WriteCtx<'_>, tag_id: &str) -> Result<()>;
         fn add_tag(&mut Self, ctx: &WriteCtx<'_>, item_id: &str, tag_id: &str) -> Result<()>;
         fn remove_tag(&mut Self, ctx: &WriteCtx<'_>, item_id: &str, tag_id: &str) -> Result<()>;

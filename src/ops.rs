@@ -327,6 +327,15 @@ pub trait VaultStore {
     fn create_tag(&mut self, ctx: &WriteCtx<'_>, name: &str, color: &str) -> Result<Tag>;
     /// Live tags sorted by name.
     fn list_tags(&self) -> Result<Vec<Tag>>;
+    /// Rename and/or recolor a live tag. Fails with `InvalidInput` if the new name is empty or used
+    /// by another live tag, and `NotFound` if the tag does not exist or is deleted.
+    fn update_tag(
+        &mut self,
+        ctx: &WriteCtx<'_>,
+        tag_id: &str,
+        name: Option<&str>,
+        color: Option<&str>,
+    ) -> Result<Tag>;
     /// Delete a tag and its links.
     fn delete_tag(&mut self, ctx: &WriteCtx<'_>, tag_id: &str) -> Result<()>;
     /// Attach a tag to an item (user choice).

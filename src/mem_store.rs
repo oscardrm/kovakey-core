@@ -695,6 +695,42 @@ impl VaultStore for MemStore {
         Ok(v)
     }
 
+    fn update_tag(
+        &mut self,
+        ctx: &WriteCtx<'_>,
+        tag_id: &str,
+        name: Option<&str>,
+        color: Option<&str>,
+    ) -> Result<Tag> {
+        if let Some(n) = name {
+            non_empty(n)?;
+        }
+        self.tx(ctx, |s| {
+            if let Some(n) = name {
+                if s.tags
+                    .iter()
+                    .any(|t| t.id != tag_id && t.deleted_at.is_none() && t.name == n)
+                {
+                    return Err(Error::InvalidInput);
+                }
+            }
+            let tag = s
+                .tags
+                .iter_mut()
+                .find(|t| t.id == tag_id && t.deleted_at.is_none())
+                .ok_or(Error::NotFound)?;
+            if let Some(n) = name {
+                tag.name = n.to_string();
+            }
+            if let Some(c) = color {
+                tag.color = c.to_string();
+            }
+            tag.updated_at = bump(tag.updated_at, ctx.now_ms);
+            tag.updated_by = ctx.device_id.to_string();
+            Ok(tag.clone())
+        })
+    }
+
     fn delete_tag(&mut self, ctx: &WriteCtx<'_>, tag_id: &str) -> Result<()> {
         self.tx(ctx, |s| {
             let tag = s
