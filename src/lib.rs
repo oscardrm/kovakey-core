@@ -21,6 +21,7 @@ pub mod notes;
 pub mod ops;
 pub mod presets;
 pub mod recovery;
+pub mod registry;
 pub mod search;
 pub mod session;
 pub mod side_blob;
