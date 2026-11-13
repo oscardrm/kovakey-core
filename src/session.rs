@@ -375,11 +375,7 @@ impl<S: VaultStore> Session<S> {
     pub fn totp_code(&self, item_id: &str, field_id: &str, unix_secs: u64) -> Result<TotpCode> {
         let value = self.store()?.reveal_field(item_id, field_id)?;
         let value = value.trim();
-        let totp = if value.starts_with("otpauth://") {
-            Totp::from_uri(value)?
-        } else {
-            Totp::from_base32(value, crate::totp::Algorithm::Sha1, 6, 30)?
-        };
+        let (totp, _) = Totp::parse_input(value)?;
         Ok(TotpCode {
             code: totp.code_at(unix_secs)?,
             seconds_remaining: totp.seconds_remaining(unix_secs),

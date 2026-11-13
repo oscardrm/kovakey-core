@@ -35,6 +35,37 @@ impl core::fmt::Debug for Totp {
     }
 }
 
+/// Non-secret label data of an `otpauth://` URI (empty strings when absent).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TotpLabel {
+    /// Service name (from the label prefix or the `issuer` parameter).
+    pub issuer: String,
+    /// Account name (usually an email or username).
+    pub account: String,
+}
+
+/// Decode `%XX` escapes and `+` is left as is (RFC 3986). Invalid escapes are kept literally.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while let Some(&b) = bytes.get(i) {
+        if b == b'%' {
+            let hex = s
+                .get(i + 1..i + 3)
+                .and_then(|h| u8::from_str_radix(h, 16).ok());
+            if let Some(v) = hex {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 fn mac<M: Mac + hmac::digest::KeyInit>(key: &[u8], msg: &[u8]) -> Result<Vec<u8>> {
     let mut m = <M as Mac>::new_from_slice(key).map_err(|_| Error::InvalidParams)?;
     m.update(msg);
@@ -75,20 +106,53 @@ impl Totp {
 
     /// Parse an `otpauth://totp/...?secret=...&algorithm=&digits=&period=` URI (QR payload).
     pub fn from_uri(uri: &str) -> Result<Self> {
-        let rest = uri
-            .strip_prefix("otpauth://totp/")
-            .ok_or(Error::Corrupted)?;
-        let query = rest
-            .split_once('?')
-            .map(|(_, q)| q)
-            .ok_or(Error::Corrupted)?;
+        Ok(Self::parse_uri(uri)?.0)
+    }
+
+    /// Parse a QR payload / pasted value: an `otpauth://totp/` URI or a bare Base32 secret
+    /// (SHA-1, 6 digits, 30 s). Returns the config plus the non-secret label data.
+    pub fn parse_input(input: &str) -> Result<(Self, TotpLabel)> {
+        let input = input.trim();
+        if input
+            .get(..10)
+            .is_some_and(|p| p.eq_ignore_ascii_case("otpauth://"))
+        {
+            Self::parse_uri(input)
+        } else {
+            let t = Self::from_base32(input, Algorithm::Sha1, 6, 30)?;
+            Ok((t, TotpLabel::default()))
+        }
+    }
+
+    fn parse_uri(uri: &str) -> Result<(Self, TotpLabel)> {
+        const PREFIX: &str = "otpauth://totp/";
+        let uri = uri.trim();
+        if !uri
+            .get(..PREFIX.len())
+            .is_some_and(|p| p.eq_ignore_ascii_case(PREFIX))
+        {
+            return Err(Error::Corrupted);
+        }
+        let rest = uri.get(PREFIX.len()..).ok_or(Error::Corrupted)?;
+        let (label, query) = rest.split_once('?').ok_or(Error::Corrupted)?;
+        let label = percent_decode(label);
+        let (mut issuer, account) = match label.split_once(':') {
+            Some((i, a)) => (i.trim().to_owned(), a.trim().to_owned()),
+            None => (String::new(), label.trim().to_owned()),
+        };
         let (mut secret, mut algo, mut digits, mut period) = (None, Algorithm::Sha1, 6u32, 30u64);
         for pair in query.split('&') {
             let Some((k, v)) = pair.split_once('=') else {
                 continue;
             };
-            match k {
-                "secret" => secret = Some(v),
+            match k.to_ascii_lowercase().as_str() {
+                "secret" => secret = Some(Zeroizing::new(percent_decode(v))),
+                "issuer" => {
+                    let v = percent_decode(v);
+                    if !v.trim().is_empty() {
+                        issuer = v.trim().to_owned();
+                    }
+                }
                 "algorithm" => {
                     algo = match v.to_ascii_uppercase().as_str() {
                         "SHA1" => Algorithm::Sha1,
@@ -102,7 +166,9 @@ impl Totp {
                 _ => {}
             }
         }
-        Self::from_base32(secret.ok_or(Error::Corrupted)?, algo, digits, period)
+        let secret = secret.ok_or(Error::Corrupted)?;
+        let totp = Self::from_base32(&secret, algo, digits, period)?;
+        Ok((totp, TotpLabel { issuer, account }))
     }
 
     /// Code for the given Unix time (seconds), zero-padded to `digits`.
@@ -136,6 +202,29 @@ mod tests {
     // RFC 6238 Appendix B secrets (ASCII "1234567890..." repeated), Base32-encoded.
     fn b32(ascii: &[u8]) -> String {
         data_encoding::BASE32_NOPAD.encode(ascii)
+    }
+
+    #[test]
+    fn parse_input_accepts_uri_and_bare_secret_with_labels() {
+        let (t, l) = Totp::parse_input(
+            " OTPAUTH://totp/Example%20Co:alice%40example.com?secret=GEZDGNBVGY3TQOJQ&issuer=Example%20Co&digits=8 ",
+        )
+        .unwrap();
+        assert_eq!((t.digits, t.period), (8, 30));
+        assert_eq!(l.issuer, "Example Co");
+        assert_eq!(l.account, "alice@example.com");
+        let (t, l) = Totp::parse_input("gezd gnbv gy3t qojq").unwrap();
+        assert_eq!((t.digits, l), (6, TotpLabel::default()));
+        // Percent-encoded secret is decoded.
+        assert!(Totp::parse_input("otpauth://totp/x?secret=GEZD%47NBVGY3TQOJQ").is_ok());
+        for bad in [
+            "",
+            "https://example.com",
+            "otpauth://hotp/x?secret=GEZDGNBV",
+            "otpauth://totp/x?issuer=y",
+        ] {
+            assert!(Totp::parse_input(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]
