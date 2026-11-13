@@ -11,6 +11,7 @@ pub mod crypto;
 pub mod db;
 pub mod error;
 pub mod generator;
+pub mod import;
 pub mod kdf;
 pub mod keys;
 pub mod mem_store;
