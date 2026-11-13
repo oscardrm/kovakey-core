@@ -78,6 +78,15 @@ fn live_item<'a>(s: &'a mut Snapshot, id: &str) -> Result<&'a mut Item> {
         .ok_or(Error::NotFound)
 }
 
+/// A live item that is not in the Trash (the only kind that can be edited or used).
+fn active_item<'a>(s: &'a mut Snapshot, id: &str) -> Result<&'a mut Item> {
+    let it = live_item(s, id)?;
+    if it.trashed_at.is_some() {
+        return Err(Error::InvalidInput);
+    }
+    Ok(it)
+}
+
 fn require_live_category(s: &Snapshot, id: &str) -> Result<()> {
     s.categories
         .iter()
@@ -406,6 +415,7 @@ fn summarize(s: &Snapshot, i: &Item) -> ItemSummary {
         last_used_at: i.last_used_at,
         updated_at: i.updated_at,
         tags: tags.into_iter().map(|(n, _)| n.to_string()).collect(),
+        trashed_at: i.trashed_at,
     }
 }
 
@@ -479,6 +489,7 @@ impl VaultStore for MemStore {
                 updated_at: ctx.now_ms,
                 updated_by: ctx.device_id.to_string(),
                 deleted_at: None,
+                trashed_at: None,
                 use_count: 0,
                 last_used_at: None,
                 history: BTreeSet::new(),
@@ -495,7 +506,7 @@ impl VaultStore for MemStore {
             non_empty(t)?;
         }
         self.tx(ctx, |s| {
-            let cur = live_item(s, id)?.clone();
+            let cur = active_item(s, id)?.clone();
             if let Some(Some(c)) = &upd.category_id {
                 require_live_category(s, c)?;
             }
@@ -575,15 +586,53 @@ impl VaultStore for MemStore {
             }
             let it = live_item(s, id)?;
             it.deleted_at = Some(t);
+            it.trashed_at = None;
             it.updated_at = t;
             it.updated_by = ctx.device_id.to_string();
             Ok(())
         })
     }
 
-    fn record_use(&mut self, ctx: &WriteCtx<'_>, id: &str) -> Result<()> {
+    fn trash_item(&mut self, ctx: &WriteCtx<'_>, id: &str) -> Result<()> {
         self.tx(ctx, |s| {
             let it = live_item(s, id)?;
+            if it.trashed_at.is_none() {
+                let t = bump(it.updated_at, ctx.now_ms);
+                it.trashed_at = Some(t);
+                it.updated_at = t;
+                it.updated_by = ctx.device_id.to_string();
+            }
+            Ok(())
+        })
+    }
+
+    fn restore_item(&mut self, ctx: &WriteCtx<'_>, id: &str) -> Result<()> {
+        self.tx(ctx, |s| {
+            let it = live_item(s, id)?;
+            if it.trashed_at.is_some() {
+                it.trashed_at = None;
+                it.updated_at = bump(it.updated_at, ctx.now_ms);
+                it.updated_by = ctx.device_id.to_string();
+            }
+            Ok(())
+        })
+    }
+
+    fn list_trashed_items(&self) -> Result<Vec<ItemSummary>> {
+        let mut out: Vec<ItemSummary> = self
+            .snap
+            .items
+            .iter()
+            .filter(|i| i.deleted_at.is_none() && i.trashed_at.is_some())
+            .map(|i| summarize(&self.snap, i))
+            .collect();
+        out.sort_by(|a, b| (b.trashed_at, &a.id).cmp(&(a.trashed_at, &b.id)));
+        Ok(out)
+    }
+
+    fn record_use(&mut self, ctx: &WriteCtx<'_>, id: &str) -> Result<()> {
+        self.tx(ctx, |s| {
+            let it = active_item(s, id)?;
             it.use_count = it.use_count.saturating_add(1);
             it.last_used_at = Some(it.last_used_at.unwrap_or(0).max(ctx.now_ms));
             Ok(())
@@ -595,7 +644,7 @@ impl VaultStore for MemStore {
             .snap
             .items
             .iter()
-            .filter(|i| i.deleted_at.is_none())
+            .filter(|i| i.deleted_at.is_none() && i.trashed_at.is_none())
             .map(|i| summarize(&self.snap, i))
             .collect();
         // Same order as the SQL backend: `COLLATE NOCASE` folds ASCII only.

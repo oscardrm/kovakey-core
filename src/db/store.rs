@@ -42,6 +42,27 @@ struct ItemRow {
     updated_at: i64,
 }
 
+/// Fails with `InvalidInput` when the (live) item is in the Trash: trashed items are read-only.
+fn ensure_not_trashed(conn: &Connection, id: &str) -> Result<()> {
+    match trashed_at(conn, id)? {
+        Some(_) => Err(Error::InvalidInput),
+        None => Ok(()),
+    }
+}
+
+/// `trashed_at` of a live item (`NotFound` for missing or permanently deleted items).
+fn trashed_at(conn: &Connection, id: &str) -> Result<Option<i64>> {
+    conn.query_row(
+        "SELECT trashed_at FROM items WHERE id=?1 AND deleted_at IS NULL",
+        [id],
+        |r| r.get(0),
+    )
+    .map_err(|e| match e {
+        rusqlite::Error::QueryReturnedNoRows => Error::NotFound,
+        other => db_err(other),
+    })
+}
+
 fn live_item(conn: &Connection, id: &str) -> Result<ItemRow> {
     conn.query_row(
         "SELECT item_type,title,url,category_id,color,favorite,updated_at
@@ -483,7 +504,7 @@ fn summaries(conn: &Connection, only: Option<&str>) -> Result<Vec<ItemSummary>> 
         .prepare(
             "SELECT i.id,i.item_type,i.title,i.url,
                     CASE WHEN c.deleted_at IS NULL THEN i.category_id END,
-                    i.color,i.favorite,i.use_count,i.last_used_at,i.updated_at
+                    i.color,i.favorite,i.use_count,i.last_used_at,i.updated_at,i.trashed_at
              FROM items i LEFT JOIN categories c ON c.id=i.category_id
              WHERE i.deleted_at IS NULL AND (?1 IS NULL OR i.id=?1)
              ORDER BY i.title COLLATE NOCASE,i.id",
@@ -502,13 +523,25 @@ fn summaries(conn: &Connection, only: Option<&str>) -> Result<Vec<ItemSummary>> 
                 r.get::<_, i64>(7)?,
                 r.get::<_, Option<i64>>(8)?,
                 r.get::<_, i64>(9)?,
+                r.get::<_, Option<i64>>(10)?,
             ))
         })
         .map_err(db_err)?;
     let mut out = Vec::new();
     for row in rows {
-        let (id, ty, title, url, category_id, color, fav, use_count, last_used_at, updated_at) =
-            row.map_err(db_err)?;
+        let (
+            id,
+            ty,
+            title,
+            url,
+            category_id,
+            color,
+            fav,
+            use_count,
+            last_used_at,
+            updated_at,
+            trashed_at,
+        ) = row.map_err(db_err)?;
         out.push(ItemSummary {
             item_type: ItemType::parse(&ty)?,
             tags: tags.remove(&id).unwrap_or_default(),
@@ -521,6 +554,7 @@ fn summaries(conn: &Connection, only: Option<&str>) -> Result<Vec<ItemSummary>> 
             use_count,
             last_used_at,
             updated_at,
+            trashed_at,
         });
     }
     Ok(out)
@@ -581,6 +615,7 @@ impl Database {
             non_empty(t)?;
         }
         let tx = self.begin(ctx)?;
+        ensure_not_trashed(&tx, id)?;
         let cur = live_item(&tx, id)?;
         if let Some(Some(c)) = &upd.category_id {
             require_live_category(&tx, c)?;
@@ -655,18 +690,58 @@ impl Database {
         )
         .map_err(db_err)?;
         tx.execute(
-            "UPDATE items SET deleted_at=?2,updated_at=?2,updated_by=?3 WHERE id=?1",
+            "UPDATE items SET deleted_at=?2,trashed_at=NULL,updated_at=?2,updated_by=?3 WHERE id=?1",
             params![id, t, ctx.device_id],
         )
         .map_err(db_err)?;
         tx.commit().map_err(db_err)
     }
 
+    /// Move a live item to the Trash, keeping its content. No-op if it is already trashed.
+    pub fn trash_item(&mut self, ctx: &WriteCtx<'_>, id: &str) -> Result<()> {
+        let tx = self.begin(ctx)?;
+        if trashed_at(&tx, id)?.is_none() {
+            let cur = live_item(&tx, id)?;
+            let t = bump(cur.updated_at, ctx.now_ms);
+            tx.execute(
+                "UPDATE items SET trashed_at=?2,updated_at=?2,updated_by=?3 WHERE id=?1",
+                params![id, t, ctx.device_id],
+            )
+            .map_err(db_err)?;
+        }
+        tx.commit().map_err(db_err)
+    }
+
+    /// Take an item out of the Trash. No-op if it is not trashed.
+    pub fn restore_item(&mut self, ctx: &WriteCtx<'_>, id: &str) -> Result<()> {
+        let tx = self.begin(ctx)?;
+        if trashed_at(&tx, id)?.is_some() {
+            let cur = live_item(&tx, id)?;
+            let t = bump(cur.updated_at, ctx.now_ms);
+            tx.execute(
+                "UPDATE items SET trashed_at=NULL,updated_at=?2,updated_by=?3 WHERE id=?1",
+                params![id, t, ctx.device_id],
+            )
+            .map_err(db_err)?;
+        }
+        tx.commit().map_err(db_err)
+    }
+
+    /// Summaries of trashed items, most recently trashed first.
+    pub fn list_trashed_items(&self) -> Result<Vec<ItemSummary>> {
+        let mut out: Vec<ItemSummary> = summaries(self.conn(), None)?
+            .into_iter()
+            .filter(|i| i.trashed_at.is_some())
+            .collect();
+        out.sort_by(|a, b| (b.trashed_at, &a.id).cmp(&(a.trashed_at, &b.id)));
+        Ok(out)
+    }
+
     /// Record one use (copy/autofill). Monotone counters; does not touch `updated_at`, so a
     /// usage bump never wins a merge against a real edit (merge keeps the max of both sides).
     pub fn record_use(&mut self, ctx: &WriteCtx<'_>, id: &str) -> Result<()> {
         let tx = self.begin(ctx)?;
-        live_item(&tx, id)?;
+        ensure_not_trashed(&tx, id)?;
         tx.execute(
             "UPDATE items SET use_count=use_count+1,last_used_at=max(coalesce(last_used_at,0),?2) WHERE id=?1",
             params![id, ctx.now_ms],
@@ -677,7 +752,9 @@ impl Database {
 
     /// Non-secret summaries of all live items, sorted by title.
     pub fn list_items(&self) -> Result<Vec<ItemSummary>> {
-        summaries(self.conn(), None)
+        let mut out = summaries(self.conn(), None)?;
+        out.retain(|i| i.trashed_at.is_none());
+        Ok(out)
     }
 
     /// A live item with its live fields (secret values withheld) and note blocks.
@@ -1229,6 +1306,9 @@ impl VaultStore for Database {
         fn create_item(&mut Self, ctx: &WriteCtx<'_>, new: &NewItem) -> Result<String>;
         fn update_item(&mut Self, ctx: &WriteCtx<'_>, id: &str, upd: &ItemUpdate) -> Result<()>;
         fn delete_item(&mut Self, ctx: &WriteCtx<'_>, id: &str) -> Result<()>;
+        fn trash_item(&mut Self, ctx: &WriteCtx<'_>, id: &str) -> Result<()>;
+        fn restore_item(&mut Self, ctx: &WriteCtx<'_>, id: &str) -> Result<()>;
+        fn list_trashed_items(&Self) -> Result<Vec<ItemSummary>>;
         fn record_use(&mut Self, ctx: &WriteCtx<'_>, id: &str) -> Result<()>;
         fn list_items(&Self) -> Result<Vec<ItemSummary>>;
         fn get_item(&Self, id: &str) -> Result<ItemDetail>;

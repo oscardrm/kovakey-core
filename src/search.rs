@@ -152,6 +152,7 @@ mod tests {
             last_used_at: None,
             updated_at: 0,
             tags: vec![],
+            trashed_at: None,
         }
     }
 

@@ -8,6 +8,7 @@
 mod snapshot;
 mod store;
 
+pub use crate::ops::{empty_trash, purge_expired_trash};
 pub use crate::ops::{
     BlockInput, CategoryFieldInput, CategoryUpdate, FieldInput, FieldView, ItemDetail, ItemSummary,
     ItemUpdate, NewCategory, NewItem, VaultStore, WriteCtx,
@@ -26,6 +27,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/001_initial.sql"),
     include_str!("migrations/002_sync_columns.sql"),
     include_str!("migrations/003_category_fields.sql"),
+    include_str!("migrations/004_trash.sql"),
 ];
 
 /// Latest schema version known to this build.

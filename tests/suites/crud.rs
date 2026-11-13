@@ -165,6 +165,149 @@ fn delete_item_tombstones_children_scrubs_secrets_and_keeps_history() {
     assert_eq!(d.delete_item(&ctx("dev-a", 300), &id), Err(Error::NotFound));
 }
 
+// ---- trash ------------------------------------------------------------------------------
+
+#[test]
+fn trashed_items_keep_their_content_and_leave_the_lists() {
+    let mut d = db();
+    let keep = login(&mut d, "dev-a", 100, "Keep", "fake-keep");
+    let id = login(&mut d, "dev-a", 110, "Bank", "fake-bank");
+    d.trash_item(&ctx("dev-a", 200), &id).unwrap();
+
+    let titles: Vec<String> = d.list_items().unwrap().into_iter().map(|i| i.title).collect();
+    assert_eq!(titles, ["Keep"]);
+    let trashed = d.list_trashed_items().unwrap();
+    assert_eq!(trashed.len(), 1);
+    assert_eq!(trashed[0].id, id);
+    assert!(trashed[0].trashed_at.is_some());
+
+    // Content is intact and still revealable (so the Trash screen can show and copy it).
+    let detail = d.get_item(&id).unwrap();
+    assert_eq!(detail.summary.trashed_at, trashed[0].trashed_at);
+    let pw = field_id(&d, &id, "password");
+    assert_eq!(d.reveal_field(&id, &pw).unwrap().as_str(), "fake-bank");
+    let snap = d.snapshot().unwrap();
+    assert!(snap
+        .item_fields
+        .iter()
+        .filter(|f| f.item_id == id)
+        .all(|f| f.deleted_at.is_none() && !f.value.is_empty()));
+    assert!(d.get_item(&keep).unwrap().summary.trashed_at.is_none());
+}
+
+#[test]
+fn trashed_items_are_read_only_until_restored() {
+    let mut d = db();
+    let id = login(&mut d, "dev-a", 100, "Bank", "fake-bank");
+    d.trash_item(&ctx("dev-a", 200), &id).unwrap();
+    let rename = ItemUpdate {
+        title: Some("Renamed".into()),
+        ..Default::default()
+    };
+    assert_eq!(
+        d.update_item(&ctx("dev-a", 210), &id, &rename),
+        Err(Error::InvalidInput)
+    );
+    assert_eq!(d.record_use(&ctx("dev-a", 210), &id), Err(Error::InvalidInput));
+
+    d.restore_item(&ctx("dev-a", 300), &id).unwrap();
+    d.update_item(&ctx("dev-a", 310), &id, &rename).unwrap();
+    assert_eq!(d.list_items().unwrap()[0].title, "Renamed");
+    assert!(d.list_trashed_items().unwrap().is_empty());
+    assert!(d.get_item(&id).unwrap().summary.trashed_at.is_none());
+}
+
+#[test]
+fn trash_and_restore_are_idempotent_and_bump_updated_at() {
+    let mut d = db();
+    let id = login(&mut d, "dev-a", 100, "Bank", "fake-bank");
+    d.trash_item(&ctx("dev-a", 200), &id).unwrap();
+    let first = d.get_item(&id).unwrap().summary;
+    d.trash_item(&ctx("dev-a", 250), &id).unwrap();
+    assert_eq!(d.get_item(&id).unwrap().summary, first, "second trash is a no-op");
+    assert!(first.updated_at >= 200);
+
+    d.restore_item(&ctx("dev-a", 300), &id).unwrap();
+    let restored = d.get_item(&id).unwrap().summary;
+    assert!(restored.updated_at > first.updated_at);
+    d.restore_item(&ctx("dev-a", 400), &id).unwrap();
+    assert_eq!(d.get_item(&id).unwrap().summary, restored, "restoring a live item is a no-op");
+}
+
+#[test]
+fn trashing_or_restoring_a_missing_item_is_not_found() {
+    let mut d = db();
+    assert_eq!(d.trash_item(&ctx("dev-a", 1), "nope"), Err(Error::NotFound));
+    assert_eq!(d.restore_item(&ctx("dev-a", 1), "nope"), Err(Error::NotFound));
+}
+
+#[test]
+fn deleting_a_trashed_item_purges_it_for_good() {
+    let mut d = db();
+    let id = login(&mut d, "dev-a", 100, "Bank", "fake-bank");
+    d.trash_item(&ctx("dev-a", 200), &id).unwrap();
+    d.delete_item(&ctx("dev-a", 300), &id).unwrap();
+
+    assert!(d.list_trashed_items().unwrap().is_empty());
+    assert_eq!(d.get_item(&id), Err(Error::NotFound));
+    assert_eq!(d.restore_item(&ctx("dev-a", 400), &id), Err(Error::NotFound));
+    let snap = d.snapshot().unwrap();
+    let item = snap.items.iter().find(|i| i.id == id).unwrap();
+    assert!(item.deleted_at.is_some() && item.trashed_at.is_none());
+    assert!(snap.item_fields.iter().all(|f| f.value.is_empty()));
+}
+
+#[test]
+fn trash_is_listed_newest_first_and_emptied_on_demand() {
+    let mut d = db();
+    let a = login(&mut d, "dev-a", 100, "A", "fake-a");
+    let b = login(&mut d, "dev-a", 110, "B", "fake-b");
+    let live = login(&mut d, "dev-a", 120, "Live", "fake-l");
+    d.trash_item(&ctx("dev-a", 200), &a).unwrap();
+    d.trash_item(&ctx("dev-a", 300), &b).unwrap();
+    let ids: Vec<String> = d.list_trashed_items().unwrap().into_iter().map(|i| i.id).collect();
+    assert_eq!(ids, [b, a]);
+
+    assert_eq!(vault_core::db::empty_trash(&mut d, &ctx("dev-a", 400)).unwrap(), 2);
+    assert!(d.list_trashed_items().unwrap().is_empty());
+    assert_eq!(d.list_items().unwrap()[0].id, live, "live items are untouched");
+}
+
+#[test]
+fn expired_trash_is_purged_by_retention_and_zero_keeps_everything() {
+    const DAY: i64 = 86_400_000;
+    let mut d = db();
+    let old = login(&mut d, "dev-a", 100, "Old", "fake-o");
+    let fresh = login(&mut d, "dev-a", 110, "Fresh", "fake-f");
+    d.trash_item(&ctx("dev-a", 1_000), &old).unwrap();
+    d.trash_item(&ctx("dev-a", 1_000 + 20 * DAY), &fresh).unwrap();
+
+    let now = 1_000 + 31 * DAY;
+    assert_eq!(vault_core::db::purge_expired_trash(&mut d, &ctx("dev-a", now), 0).unwrap(), 0);
+    assert_eq!(vault_core::db::purge_expired_trash(&mut d, &ctx("dev-a", now), 30).unwrap(), 1);
+    let left: Vec<String> = d.list_trashed_items().unwrap().into_iter().map(|i| i.id).collect();
+    assert_eq!(left, [fresh], "only the item past the retention window is purged");
+    assert_eq!(d.get_item(&old), Err(Error::NotFound));
+}
+
+#[test]
+fn trash_state_survives_a_snapshot_merge() {
+    let mut a = db();
+    let id = login(&mut a, "dev-a", 100, "Bank", "fake-bank");
+    let mut b = db();
+    b.merge_remote(&a.snapshot().unwrap()).unwrap();
+    a.trash_item(&ctx("dev-a", 200), &id).unwrap();
+    b.merge_remote(&a.snapshot().unwrap()).unwrap();
+    assert_eq!(b.list_trashed_items().unwrap().len(), 1);
+    assert!(b.list_items().unwrap().is_empty());
+
+    // Restoring on the other device later wins the last-writer merge.
+    b.restore_item(&ctx("dev-b", 300), &id).unwrap();
+    a.merge_remote(&b.snapshot().unwrap()).unwrap();
+    assert!(a.list_trashed_items().unwrap().is_empty());
+    assert_eq!(a.list_items().unwrap().len(), 1);
+}
+
 #[test]
 fn removing_a_field_or_block_tombstones_and_scrubs_it() {
     let mut d = db();

@@ -253,6 +253,8 @@ pub struct ItemSummary {
     pub updated_at: i64,
     /// Names of live tags.
     pub tags: Vec<String>,
+    /// When the item was moved to the Trash (`None` for items outside the Trash).
+    pub trashed_at: Option<i64>,
 }
 
 /// Field as shown by [`Database::get_item`]: secret values are withheld.
@@ -301,6 +303,42 @@ pub(crate) fn non_empty(s: &str) -> Result<()> {
     }
 }
 
+const DAY_MS: i64 = 86_400_000;
+
+/// Permanently delete every trashed item (tombstone + content wipe). Returns how many were purged.
+pub fn empty_trash<S: VaultStore>(store: &mut S, ctx: &WriteCtx<'_>) -> Result<u32> {
+    let mut purged = 0;
+    for item in store.list_trashed_items()? {
+        store.delete_item(ctx, &item.id)?;
+        purged += 1;
+    }
+    Ok(purged)
+}
+
+/// Permanently delete trashed items that have been in the Trash for at least `retention_days`
+/// (PRD §9.3, default 30 in the apps). `retention_days == 0` keeps trashed items forever.
+/// Returns how many were purged.
+pub fn purge_expired_trash<S: VaultStore>(
+    store: &mut S,
+    ctx: &WriteCtx<'_>,
+    retention_days: u32,
+) -> Result<u32> {
+    if retention_days == 0 {
+        return Ok(0);
+    }
+    let cutoff = ctx
+        .now_ms
+        .saturating_sub(i64::from(retention_days).saturating_mul(DAY_MS));
+    let mut purged = 0;
+    for item in store.list_trashed_items()? {
+        if item.trashed_at.is_some_and(|t| t <= cutoff) {
+            store.delete_item(ctx, &item.id)?;
+            purged += 1;
+        }
+    }
+    Ok(purged)
+}
+
 /// Storage backend of an unlocked vault: the full CRUD surface plus snapshot access.
 ///
 /// Implemented by the SQLCipher `Database` (native) and by [`crate::mem_store::MemStore`]
@@ -311,11 +349,20 @@ pub trait VaultStore {
     fn create_item(&mut self, ctx: &WriteCtx<'_>, new: &NewItem) -> Result<String>;
     /// Update an item; writes nothing if no value changes.
     fn update_item(&mut self, ctx: &WriteCtx<'_>, id: &str, upd: &ItemUpdate) -> Result<()>;
-    /// Tombstone an item with its children and scrub secret payloads.
+    /// Permanently delete an item (live or trashed): tombstone it with its children and scrub
+    /// secret payloads. Use [`VaultStore::trash_item`] for the recoverable delete.
     fn delete_item(&mut self, ctx: &WriteCtx<'_>, id: &str) -> Result<()>;
+    /// Move a live item to the Trash. Its content is kept; it disappears from
+    /// [`VaultStore::list_items`], search and autofill. Trashing a trashed item is a no-op.
+    fn trash_item(&mut self, ctx: &WriteCtx<'_>, id: &str) -> Result<()>;
+    /// Take an item out of the Trash. Restoring an item that is not trashed is a no-op;
+    /// a permanently deleted item is `NotFound`.
+    fn restore_item(&mut self, ctx: &WriteCtx<'_>, id: &str) -> Result<()>;
+    /// Summaries of trashed items, most recently trashed first.
+    fn list_trashed_items(&self) -> Result<Vec<ItemSummary>>;
     /// Record one use (copy/autofill).
     fn record_use(&mut self, ctx: &WriteCtx<'_>, id: &str) -> Result<()>;
-    /// Non-secret summaries of all live items, sorted by title.
+    /// Non-secret summaries of all live items outside the Trash, sorted by title.
     fn list_items(&self) -> Result<Vec<ItemSummary>>;
     /// A live item with fields (secrets withheld) and note blocks.
     fn get_item(&self, id: &str) -> Result<ItemDetail>;

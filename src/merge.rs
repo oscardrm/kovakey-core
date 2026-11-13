@@ -184,6 +184,7 @@ mod tests {
             updated_at: t,
             updated_by: dev.into(),
             deleted_at: del,
+            trashed_at: None,
             use_count: 0,
             last_used_at: None,
             history: BTreeSet::new(),

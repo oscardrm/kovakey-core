@@ -7,7 +7,7 @@ use crate::models::{NoteImage, Snapshot};
 use crate::side_blob::{is_external, sha256_hex};
 
 /// Current snapshot payload format version.
-pub const SNAPSHOT_FORMAT_VERSION: u8 = 2;
+pub const SNAPSHOT_FORMAT_VERSION: u8 = 3;
 
 /// Result of [`encode_snapshot`].
 pub struct EncodedSnapshot<'a> {
@@ -21,7 +21,8 @@ pub struct EncodedSnapshot<'a> {
 pub type ImageResolver<'a> = dyn FnMut(&str, u64) -> Result<Zeroizing<Vec<u8>>> + 'a;
 
 /// Serialize `snapshot` at [`SNAPSHOT_FORMAT_VERSION`] (v2 = the frozen v1 payload followed by
-/// the category extension: preset keys and category field templates).
+/// the category extension: preset keys and category field templates; v3 appends the Trash
+/// extension: the trash time of each trashed item).
 ///
 /// Image `sha256`/`size` are verified against the bytes (ADR 0001: never trusted on save);
 /// a mismatch is [`Error::InvalidInput`]. Images above the side-blob threshold are replaced by a
@@ -35,6 +36,11 @@ fn encode_at(snapshot: &Snapshot, version: u8) -> Result<EncodedSnapshot<'_>> {
     let mut bytes = postcard::to_allocvec(&wire).map_err(|_| Error::Corrupted)?;
     if version >= 2 {
         let ext = v2::Ext::from_snapshot(snapshot);
+        let tail = postcard::to_allocvec(&ext).map_err(|_| Error::Corrupted)?;
+        bytes.extend_from_slice(&tail);
+    }
+    if version >= 3 {
+        let ext = v3::Ext::from_snapshot(snapshot);
         let tail = postcard::to_allocvec(&ext).map_err(|_| Error::Corrupted)?;
         bytes.extend_from_slice(&tail);
     }
@@ -56,14 +62,22 @@ pub fn decode_snapshot(
 ) -> Result<Snapshot> {
     match version {
         1 => v1::decode(bytes, resolve),
-        2 => {
+        2 | 3 => {
             let (mut snap, rest) = v1::decode_prefix(bytes, resolve)?;
             let (ext, rest) =
                 postcard::take_from_bytes::<v2::Ext>(rest).map_err(|_| Error::Corrupted)?;
+            ext.apply(&mut snap)?;
+            let rest = if version >= 3 {
+                let (trash, rest) =
+                    postcard::take_from_bytes::<v3::Ext>(rest).map_err(|_| Error::Corrupted)?;
+                trash.apply(&mut snap)?;
+                rest
+            } else {
+                rest
+            };
             if !rest.is_empty() {
                 return Err(Error::Corrupted);
             }
-            ext.apply(&mut snap)?;
             Ok(snap)
         }
         _ => Err(Error::UnsupportedVersion),
@@ -75,14 +89,14 @@ pub fn decode_snapshot(
 pub fn external_image_refs(version: u8, bytes: &[u8]) -> Result<Vec<(String, u64)>> {
     match version {
         1 => v1::external_refs(bytes),
-        2 => v1::external_refs_prefix(bytes),
+        2 | 3 => v1::external_refs_prefix(bytes),
         _ => Err(Error::UnsupportedVersion),
     }
 }
 
 /// Whether this build can decode `version`.
 pub fn is_supported_version(version: u8) -> bool {
-    matches!(version, 1 | 2)
+    matches!(version, 1..=3)
 }
 
 /// Wire format v1. **Frozen**: postcard is not self-describing, so any change to these types
@@ -452,6 +466,7 @@ mod v1 {
                     updated_at: i.updated_at,
                     updated_by: take(&mut i.updated_by),
                     deleted_at: i.deleted_at,
+                    trashed_at: None,
                     use_count: i.use_count,
                     last_used_at: i.last_used_at,
                     history,
@@ -658,6 +673,55 @@ mod v2 {
     }
 }
 
+/// Wire format v3 extension (after the v2 one): the Trash state. Frozen like the others.
+mod v3 {
+    use serde::{Deserialize, Serialize};
+
+    use crate::error::{Error, Result};
+    use crate::models::Snapshot;
+
+    #[derive(Serialize, Deserialize)]
+    pub(super) struct TrashedW {
+        pub(super) item_id: String,
+        pub(super) trashed_at: i64,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    pub struct Ext {
+        pub(super) trashed: Vec<TrashedW>,
+    }
+
+    impl Ext {
+        pub fn from_snapshot(s: &Snapshot) -> Self {
+            Self {
+                trashed: s
+                    .items
+                    .iter()
+                    .filter_map(|i| {
+                        i.trashed_at.map(|t| TrashedW {
+                            item_id: i.id.clone(),
+                            trashed_at: t,
+                        })
+                    })
+                    .collect(),
+            }
+        }
+
+        pub fn apply(self, snap: &mut Snapshot) -> Result<()> {
+            for t in self.trashed {
+                // A reference to an unknown item means the payload is damaged.
+                let item = snap
+                    .items
+                    .iter_mut()
+                    .find(|i| i.id == t.item_id)
+                    .ok_or(Error::Corrupted)?;
+                item.trashed_at = Some(t.trashed_at);
+            }
+            Ok(())
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod fixtures {
     use std::collections::BTreeSet;
@@ -777,6 +841,7 @@ pub(crate) mod fixtures {
                     updated_at: 1_700_000_005_000,
                     updated_by: "dev-a".into(),
                     deleted_at: None,
+                    trashed_at: None,
                     use_count: 3,
                     last_used_at: Some(1_700_000_006_000),
                     history: BTreeSet::from([
@@ -796,6 +861,7 @@ pub(crate) mod fixtures {
                     updated_at: 1_700_000_005_500,
                     updated_by: "dev-b".into(),
                     deleted_at: Some(1_700_000_007_000),
+                    trashed_at: None,
                     use_count: 0,
                     last_used_at: None,
                     history: BTreeSet::new(),
@@ -957,7 +1023,7 @@ mod tests {
     fn unknown_versions_are_rejected_before_parsing() {
         let snap = sample(false);
         let enc = encode_snapshot(&snap).unwrap();
-        for v in [0u8, 3, 255] {
+        for v in [0u8, 4, 255] {
             let r = decode_snapshot(v, &enc.payload, &mut no_resolver());
             assert_eq!(r.err(), Some(Error::UnsupportedVersion), "v{v}");
         }
@@ -996,18 +1062,32 @@ mod tests {
         "/tests/fixtures/snapshot_v2.postcard"
     );
 
+    const GOLDEN_V3: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/snapshot_v3.postcard"
+    );
+
+    /// The sample with `item-1` in the Trash (what the v3 golden file pins).
+    fn trashed_sample(big: bool) -> Snapshot {
+        let mut s = sample(big);
+        if let Some(i) = s.items.iter_mut().find(|i| i.id == "item-1") {
+            i.trashed_at = Some(1_700_000_008_000);
+        }
+        s
+    }
+
     /// Regenerate with `TV_REGEN_GOLDEN=1 cargo test -p vault-core regenerate_snapshot_golden -- --ignored`.
-    /// Only do that when intentionally adding a new format version. (v1 is frozen: never
-    /// regenerate it; only the current version's file may be written.)
+    /// Only do that when intentionally adding a new format version. (v1 and v2 are frozen: never
+    /// regenerate them; only the current version's file may be written.)
     #[test]
     #[ignore]
     fn regenerate_snapshot_golden() {
         if std::env::var("TV_REGEN_GOLDEN").is_err() {
             return;
         }
-        let snap = sample(true);
+        let snap = trashed_sample(true);
         let enc = encode_snapshot(&snap).unwrap();
-        std::fs::write(GOLDEN_V2, &*enc.payload).unwrap();
+        std::fs::write(GOLDEN_V3, &*enc.payload).unwrap();
     }
 
     fn big_resolver(h: &str, size: u64) -> Result<Zeroizing<Vec<u8>>> {
@@ -1039,16 +1119,66 @@ mod tests {
     }
 
     #[test]
-    fn current_encoder_still_produces_the_golden_v2_bytes() {
+    fn v2_encoder_still_produces_the_golden_v2_bytes() {
         let bytes = std::fs::read(GOLDEN_V2).unwrap();
         let snap = sample(true);
+        assert_eq!(*encode_at(&snap, 2).unwrap().payload, bytes);
+    }
+
+    #[test]
+    fn golden_v3_blob_decodes_to_the_expected_snapshot() {
+        let bytes = std::fs::read(GOLDEN_V3).unwrap();
+        let out = decode_snapshot(3, &bytes, &mut big_resolver).unwrap();
+        assert_eq!(out, trashed_sample(true));
+    }
+
+    #[test]
+    fn current_encoder_still_produces_the_golden_v3_bytes() {
+        let bytes = std::fs::read(GOLDEN_V3).unwrap();
+        let snap = trashed_sample(true);
         assert_eq!(*encode_snapshot(&snap).unwrap().payload, bytes);
+    }
+
+    #[test]
+    fn v3_round_trips_trash_state_and_v2_drops_it() {
+        let snap = trashed_sample(false);
+        let out = round_trip(&snap);
+        assert_eq!(
+            out.items
+                .iter()
+                .find(|i| i.id == "item-1")
+                .unwrap()
+                .trashed_at,
+            Some(1_700_000_008_000)
+        );
+        // An older (v2) encoding cannot carry the trash state.
+        let v2 = encode_at(&snap, 2).unwrap();
+        let out = decode_snapshot(2, &v2.payload, &mut no_resolver()).unwrap();
+        assert!(out.items.iter().all(|i| i.trashed_at.is_none()));
+    }
+
+    #[test]
+    fn v3_rejects_a_trash_entry_for_an_unknown_item() {
+        let snap = trashed_sample(false);
+        let mut bytes = encode_at(&snap, 2).unwrap().payload.to_vec();
+        let bogus = postcard::to_allocvec(&v3::Ext {
+            trashed: vec![v3::TrashedW {
+                item_id: "nope".into(),
+                trashed_at: 1,
+            }],
+        })
+        .unwrap();
+        bytes.extend_from_slice(&bogus);
+        assert_eq!(
+            decode_snapshot(3, &bytes, &mut no_resolver()).err(),
+            Some(Error::Corrupted)
+        );
     }
 
     #[test]
     fn v2_rejects_unknown_input_kind_and_trailing_bytes() {
         let mut snap = sample(false);
-        let mut enc = encode_snapshot(&snap).unwrap().payload.to_vec();
+        let mut enc = encode_at(&snap, 2).unwrap().payload.to_vec();
         enc.push(0);
         assert_eq!(
             decode_snapshot(2, &enc, &mut no_resolver()).err(),
@@ -1057,7 +1187,7 @@ mod tests {
         if let Some(f) = snap.category_fields.first_mut() {
             f.kind = "bogus".into();
         }
-        let bad = encode_snapshot(&snap).unwrap();
+        let bad = encode_at(&snap, 2).unwrap();
         assert_eq!(
             decode_snapshot(2, &bad.payload, &mut no_resolver()).err(),
             Some(Error::Corrupted)

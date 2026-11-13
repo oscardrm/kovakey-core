@@ -110,7 +110,7 @@ fn read_all(conn: &Connection) -> Result<Snapshot> {
     let mut items = query(
         conn,
         "SELECT id,category_id,item_type,title,url,color,favorite,use_count,last_used_at,
-                created_at,updated_at,updated_by,deleted_at
+                created_at,updated_at,updated_by,deleted_at,trashed_at
          FROM items ORDER BY id",
         |r| {
             let ty: String = r.get(2)?;
@@ -128,6 +128,7 @@ fn read_all(conn: &Connection) -> Result<Snapshot> {
                 updated_at: r.get(10)?,
                 updated_by: r.get(11)?,
                 deleted_at: r.get(12)?,
+                trashed_at: r.get(13)?,
                 history: BTreeSet::new(),
             })
         },
@@ -321,8 +322,8 @@ fn write_all(conn: &Connection, snap: &Snapshot) -> Result<()> {
         // Usage counters are monotone: keep the max of stored and incoming values.
         conn.execute(
             "INSERT INTO items(id,category_id,item_type,title,url,color,favorite,use_count,last_used_at,
-                               created_at,updated_at,updated_by,deleted_at)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
+                               created_at,updated_at,updated_by,deleted_at,trashed_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)
              ON CONFLICT(id) DO UPDATE SET category_id=excluded.category_id,
                item_type=excluded.item_type,title=excluded.title,url=excluded.url,
                color=excluded.color,favorite=excluded.favorite,
@@ -331,7 +332,8 @@ fn write_all(conn: &Connection, snap: &Snapshot) -> Result<()> {
                                  WHEN excluded.last_used_at IS NULL THEN items.last_used_at
                                  ELSE max(items.last_used_at,excluded.last_used_at) END,
                created_at=excluded.created_at,updated_at=excluded.updated_at,
-               updated_by=excluded.updated_by,deleted_at=excluded.deleted_at
+               updated_by=excluded.updated_by,deleted_at=excluded.deleted_at,
+               trashed_at=excluded.trashed_at
              WHERE (excluded.updated_at,excluded.updated_by) >= (items.updated_at,items.updated_by)",
             params![
                 i.id,
@@ -346,7 +348,8 @@ fn write_all(conn: &Connection, snap: &Snapshot) -> Result<()> {
                 i.created_at,
                 i.updated_at,
                 i.updated_by,
-                i.deleted_at
+                i.deleted_at,
+                i.trashed_at
             ],
         )
         .map_err(db_err)?;

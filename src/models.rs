@@ -116,8 +116,12 @@ pub struct Item {
     pub updated_at: i64,
     /// Device id of the last writer (deterministic tie-break).
     pub updated_by: String,
-    /// Tombstone time; `Some` means deleted.
+    /// Tombstone time; `Some` means permanently deleted (content wiped).
     pub deleted_at: Option<i64>,
+    /// Time the item was moved to the Trash (PRD §9.3), Unix ms UTC. A trashed item keeps its
+    /// content, is hidden from lists/search/autofill and can be restored until it is purged
+    /// (tombstoned). Travels with the item row, so it merges last-writer-wins like any edit.
+    pub trashed_at: Option<i64>,
     // The three fields below are *absorbed* on merge (max / max / union) rather than chosen by
     // last-writer-wins. They must stay last: the derived `Ord` is the final merge tie-break and
     // must not depend on values that `absorb` rewrites.
