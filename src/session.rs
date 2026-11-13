@@ -14,7 +14,9 @@ use crate::error::{Error, Result};
 use crate::keys::{DeviceEnrollment, DeviceKey, VaultHeader, VaultKeys};
 use crate::ops::{non_empty, VaultStore, WriteCtx};
 use crate::recovery::RecoveryKey;
-use crate::search::{filter_items, ItemFilter};
+use crate::search::{
+    filter_items, group_by_category, matches_global, split_terms, ItemFilter, SearchGroup,
+};
 use crate::totp::Totp;
 use crate::vault_file::{self, SealedVault};
 
@@ -195,6 +197,31 @@ impl<S: VaultStore> Session<S> {
     /// Search, filter and sort live items (non-secret fields only).
     pub fn search(&self, filter: &ItemFilter) -> Result<Vec<crate::ops::ItemSummary>> {
         Ok(filter_items(self.store()?.list_items()?, filter))
+    }
+
+    /// Global search across the whole vault: every term must occur in an item's title, URL, tag
+    /// or **non-secret** field value (e.g. a username or email). Hits are grouped by category in
+    /// category display order, uncategorized last. A blank query returns no groups.
+    pub fn search_grouped(&self, query: &str) -> Result<Vec<SearchGroup>> {
+        let terms = split_terms(query);
+        if terms.is_empty() {
+            return Ok(Vec::new());
+        }
+        let store = self.store()?;
+        let mut hits = Vec::new();
+        for summary in store.list_items()? {
+            let values: Vec<String> = store
+                .get_item(&summary.id)?
+                .fields
+                .into_iter()
+                .filter_map(|f| f.value)
+                .collect();
+            if matches_global(&summary, &values, &terms) {
+                hits.push(summary);
+            }
+        }
+        let order: Vec<String> = store.list_categories()?.into_iter().map(|c| c.id).collect();
+        Ok(group_by_category(hits, &order))
     }
 
     /// Strength of every live item's primary password (first `password` field), computed locally.
@@ -665,6 +692,36 @@ mod tests {
         assert!(get(&b).reused && get(&c).reused);
         assert_eq!(get(&b).level, crate::generator::Strength::Strong);
         assert!(r.iter().all(|p| p.key.is_empty()));
+    }
+
+    #[test]
+    fn search_grouped_matches_non_secret_values_but_never_secrets() {
+        let (mut s, _) = new_mem();
+        let id = s
+            .write(10, |st, ctx| {
+                st.create_item(
+                    ctx,
+                    &NewItem {
+                        item_type: ItemType::Credential,
+                        title: "Mail".into(),
+                        url: None,
+                        category_id: None,
+                        color: None,
+                        favorite: false,
+                        fields: vec![
+                            FieldInput::new("Username", "email", "me@example.org", false),
+                            FieldInput::new("Password", "password", "hunter2-secret", true),
+                        ],
+                        blocks: vec![],
+                    },
+                )
+            })
+            .unwrap();
+        let g = s.search_grouped("me@example").unwrap();
+        assert_eq!(g.len(), 1);
+        assert_eq!(g[0].items[0].id, id);
+        assert!(s.search_grouped("hunter2").unwrap().is_empty());
+        assert!(s.search_grouped("  ").unwrap().is_empty());
     }
 
     #[test]

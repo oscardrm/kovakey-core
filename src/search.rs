@@ -78,6 +78,63 @@ pub fn filter_items(items: Vec<ItemSummary>, filter: &ItemFilter) -> Vec<ItemSum
     out
 }
 
+/// Search hits that share a category (see [`group_by_category`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SearchGroup {
+    /// Category of every item in the group; `None` collects uncategorized items.
+    pub category_id: Option<String>,
+    /// Matching items, in the order they were given.
+    pub items: Vec<ItemSummary>,
+}
+
+/// Lower-cased whitespace-separated search terms.
+pub fn split_terms(query: &str) -> Vec<String> {
+    query.split_whitespace().map(str::to_lowercase).collect()
+}
+
+/// Whether every term occurs (case-insensitive) in the title, URL, a tag name or one of
+/// `values` (the item's non-secret field values). Empty `terms` match nothing here: a global
+/// search with no query has no hits.
+pub fn matches_global(item: &ItemSummary, values: &[String], terms: &[String]) -> bool {
+    if terms.is_empty() {
+        return false;
+    }
+    let mut haystack: Vec<String> = vec![item.title.to_lowercase()];
+    haystack.extend(item.url.iter().map(|u| u.to_lowercase()));
+    haystack.extend(item.tags.iter().map(|t| t.to_lowercase()));
+    haystack.extend(values.iter().map(|v| v.to_lowercase()));
+    terms
+        .iter()
+        .all(|t| haystack.iter().any(|h| h.contains(t.as_str())))
+}
+
+/// Group `items` by category. Groups follow `category_order` (ids of live categories in display
+/// order); categories missing from it come after, then the uncategorized group last.
+pub fn group_by_category(items: Vec<ItemSummary>, category_order: &[String]) -> Vec<SearchGroup> {
+    let mut groups: Vec<SearchGroup> = Vec::new();
+    for item in items {
+        match groups
+            .iter_mut()
+            .find(|g| g.category_id == item.category_id)
+        {
+            Some(g) => g.items.push(item),
+            None => groups.push(SearchGroup {
+                category_id: item.category_id.clone(),
+                items: vec![item],
+            }),
+        }
+    }
+    let rank = |g: &SearchGroup| match &g.category_id {
+        Some(id) => category_order
+            .iter()
+            .position(|c| c == id)
+            .unwrap_or(category_order.len()),
+        None => usize::MAX,
+    };
+    groups.sort_by_key(rank); // stable
+    groups
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -164,5 +221,33 @@ mod tests {
         assert_eq!(ids(&s(SortOrder::RecentlyUsed)), ["c", "a", "b"]);
         assert_eq!(ids(&s(SortOrder::RecentlyModified)), ["b", "c", "a"]);
         assert_eq!(ids(&s(SortOrder::Title)), ["b", "a", "c"]);
+    }
+
+    #[test]
+    fn global_match_covers_field_values_and_requires_all_terms() {
+        let it = item("a", "Work mail", ItemType::Credential);
+        let vals = vec!["Oscardario.Roman@gmail.com".to_string()];
+        let t = |q: &str| split_terms(q);
+        assert!(matches_global(&it, &vals, &t("oscardario.roman@gmail")));
+        assert!(matches_global(&it, &vals, &t("WORK gmail")));
+        assert!(!matches_global(&it, &vals, &t("gmail bank")));
+        assert!(!matches_global(&it, &vals, &t("   ")));
+        assert!(!matches_global(&it, &[], &t("gmail")));
+    }
+
+    #[test]
+    fn groups_follow_category_order_with_uncategorized_last() {
+        let mut a = item("a", "A", ItemType::Credential);
+        a.category_id = Some("c2".into());
+        let b = item("b", "B", ItemType::Note);
+        let mut c = item("c", "C", ItemType::Card);
+        c.category_id = Some("c1".into());
+        let mut d = item("d", "D", ItemType::Credential);
+        d.category_id = Some("c2".into());
+        let order = vec!["c1".to_string(), "c2".to_string()];
+        let g = group_by_category(vec![a, b, c, d], &order);
+        let keys: Vec<Option<&str>> = g.iter().map(|g| g.category_id.as_deref()).collect();
+        assert_eq!(keys, [Some("c1"), Some("c2"), None]);
+        assert_eq!(ids(&g[1].items), ["a", "d"]);
     }
 }
