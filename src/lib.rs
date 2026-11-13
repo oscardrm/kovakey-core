@@ -24,6 +24,7 @@ pub mod recovery;
 pub mod search;
 pub mod session;
 pub mod side_blob;
+pub mod storage;
 pub mod strength;
 pub mod tagger;
 pub mod totp;

@@ -12,6 +12,8 @@ workspace = true
 default = ["sqlcipher"]
 # Encrypted on-disk database. Native targets only (not wasm32).
 sqlcipher = ["dep:rusqlite"]
+# Google Drive (appDataFolder) storage provider (ADR 0010). Pure logic over an injected HTTP transport.
+gdrive = []
 
 [dependencies]
 aes-gcm = "0.10"
