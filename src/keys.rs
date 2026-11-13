@@ -225,6 +225,22 @@ impl VaultHeader {
         })
     }
 
+    /// Replace the Recovery Key: generate a new one and re-wrap the data key with it. The old
+    /// Recovery Key stops working once the returned header is persisted. The data key and the
+    /// password wrap are unchanged, so device wraps and sealed blobs stay valid.
+    pub fn rotate_recovery(&self, keys: &VaultKeys) -> Result<(Self, RecoveryKey)> {
+        let recovery = RecoveryKey::generate()?;
+        let kek = recovery.derive_kek()?;
+        let wrapped = wrap(&kek, &keys.data_key, &aad(&self.vault_id, b"rk", &[]))?;
+        Ok((
+            Self {
+                wrapped_by_recovery: wrapped,
+                ..self.clone()
+            },
+            recovery,
+        ))
+    }
+
     /// Vault id (UUIDv7 bytes).
     pub fn vault_id(&self) -> &[u8; ID_LEN] {
         &self.vault_id
@@ -321,6 +337,24 @@ mod tests {
         );
         assert!(h2.unlock_with_recovery(&r).is_ok());
         assert_ne!(h2.kdf, h.kdf);
+    }
+
+    #[test]
+    fn rotate_recovery_replaces_the_key_and_keeps_password_and_data_key() {
+        let (h, k, old) = new_vault();
+        let (h2, new) = h.rotate_recovery(&k).unwrap();
+        assert!(h2.unlock_with_recovery(&old).is_err());
+        assert_eq!(
+            h2.unlock_with_recovery(&new).unwrap().data_key().expose(),
+            k.data_key().expose()
+        );
+        assert!(h2.unlock(PW).is_ok());
+        assert_eq!(h2.vault_id, h.vault_id);
+        assert_eq!(h2.wrapped_by_password, h.wrapped_by_password);
+        assert_ne!(h2.wrapped_by_recovery, h.wrapped_by_recovery);
+        // Survives serialization.
+        let parsed = VaultHeader::from_bytes(&h2.to_bytes()).unwrap();
+        assert!(parsed.unlock_with_recovery(&new).is_ok());
     }
 
     #[test]

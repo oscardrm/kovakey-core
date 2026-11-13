@@ -175,6 +175,28 @@ impl<S: VaultStore> Session<S> {
         Ok(header)
     }
 
+    /// `true` while this session was unlocked with the Recovery Key and the Master Password has
+    /// not been changed yet: hosts must then require the user to set a new password.
+    pub fn requires_password_reset(&self) -> bool {
+        self.via_recovery
+    }
+
+    /// Replace the Recovery Key and return the new header (persist it) and the new key in display
+    /// form (show it exactly once). The current password is re-verified unless the session was
+    /// unlocked with the Recovery Key. The old Recovery Key stops working.
+    pub fn rotate_recovery_key(
+        &mut self,
+        current_password: &str,
+    ) -> Result<(VaultHeader, Zeroizing<String>)> {
+        let st = self.state.as_ref().ok_or(Error::Locked)?;
+        if !self.via_recovery {
+            self.header.unlock(current_password.as_bytes())?;
+        }
+        let (header, recovery) = self.header.rotate_recovery(&st.keys)?;
+        self.header = header.clone();
+        Ok((header, recovery.to_display_string()))
+    }
+
     /// Read-only access to the store.
     pub fn store(&self) -> Result<&S> {
         self.state.as_ref().map(|u| &u.store).ok_or(Error::Locked)
@@ -545,6 +567,50 @@ mod tests {
             Session::<MemStore>::unlock_with_recovery(&h, &recovery, "d", |_| Ok(MemStore::new()))
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn rotating_the_recovery_key_requires_the_password_and_invalidates_the_old_key() {
+        let (mut s, old) = new_mem();
+        assert!(!s.requires_password_reset());
+        assert_eq!(
+            s.rotate_recovery_key("wrong-fake-pass").err(),
+            Some(Error::Decryption)
+        );
+        let (h, new) = s.rotate_recovery_key(PW).unwrap();
+        assert_eq!(&h, s.header());
+        let open = |h: &VaultHeader, k: &str| {
+            Session::<MemStore>::unlock_with_recovery(h, k, "d", |_| Ok(MemStore::new()))
+        };
+        assert!(open(&h, &old).is_err());
+        assert!(open(&h, &new).is_ok());
+        assert!(h.unlock(PW.as_bytes()).is_ok());
+        let mut locked = s;
+        locked.lock();
+        assert_eq!(locked.rotate_recovery_key(PW).err(), Some(Error::Locked));
+    }
+
+    #[test]
+    fn recovery_unlock_requires_a_password_reset_until_the_password_changes() {
+        let (s, recovery) = new_mem();
+        let mut r = Session::<MemStore>::unlock_with_recovery(s.header(), &recovery, "d", |_| {
+            Ok(MemStore::new())
+        })
+        .unwrap();
+        assert!(r.requires_password_reset());
+        // Rotation after a recovery unlock needs no password (the old key was just exposed).
+        let (h, new) = r.rotate_recovery_key("").unwrap();
+        assert!(
+            Session::<MemStore>::unlock_with_recovery(&h, &recovery, "d", |_| Ok(MemStore::new()))
+                .is_err()
+        );
+        assert!(
+            Session::<MemStore>::unlock_with_recovery(&h, &new, "d", |_| Ok(MemStore::new()))
+                .is_ok()
+        );
+        assert!(r.requires_password_reset());
+        r.change_password("", "new-fake-pass").unwrap();
+        assert!(!r.requires_password_reset());
     }
 
     #[test]
