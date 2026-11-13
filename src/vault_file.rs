@@ -23,7 +23,7 @@ use crate::keys::{VaultHeader, VaultKeys, HEADER_LEN};
 use crate::models::Snapshot;
 use crate::side_blob::{self, SideBlob};
 
-const PAYLOAD_LABEL: &[u8] = b"truevault/snapshot/v1";
+const PAYLOAD_LABEL: &[u8] = b"vault/snapshot/v1";
 const PAYLOAD_PURPOSE: &[u8] = b"TVPL";
 
 /// Output of [`seal_vault`].

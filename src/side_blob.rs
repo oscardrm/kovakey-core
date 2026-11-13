@@ -17,8 +17,8 @@ pub const SIDE_BLOB_THRESHOLD: usize = 64 * 1024;
 const MAGIC: &[u8; 4] = b"TVSB";
 /// Side blob format version (bound into the AAD).
 const BLOB_VERSION: u8 = 1;
-const SEAL_LABEL: &[u8] = b"truevault/side-blob/v1";
-const NAME_LABEL: &[u8] = b"truevault/side-blob-name/v1";
+const SEAL_LABEL: &[u8] = b"vault/side-blob/v1";
+const NAME_LABEL: &[u8] = b"vault/side-blob-name/v1";
 const HASH_LEN: usize = 32;
 
 /// An encrypted side blob and its storage name.

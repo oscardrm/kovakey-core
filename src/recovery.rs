@@ -13,7 +13,7 @@ use crate::error::{Error, Result};
 const SECRET_LEN: usize = 16;
 const CHECK_LEN: usize = 4;
 const GROUP: usize = 4;
-const KEK_LABEL: &[u8] = b"truevault/recovery-kek/v1";
+const KEK_LABEL: &[u8] = b"vault/recovery-kek/v1";
 
 /// A user-facing Recovery Key. Zeroized on drop, redacted `Debug`, not `Clone`.
 #[derive(Zeroize, ZeroizeOnDrop)]
@@ -26,7 +26,7 @@ impl core::fmt::Debug for RecoveryKey {
 }
 
 fn checksum(secret: &[u8; SECRET_LEN]) -> [u8; CHECK_LEN] {
-    let digest = Sha256::digest([b"truevault/recovery-check/v1".as_slice(), secret].concat());
+    let digest = Sha256::digest([b"vault/recovery-check/v1".as_slice(), secret].concat());
     let mut out = [0u8; CHECK_LEN];
     out.copy_from_slice(digest.get(..CHECK_LEN).unwrap_or(&[0; CHECK_LEN]));
     out

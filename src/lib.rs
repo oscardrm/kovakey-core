@@ -1,4 +1,4 @@
-//! TrueVault core: all business logic (crypto, key hierarchy, recovery, storage).
+//! KovaKey core: all business logic (crypto, key hierarchy, recovery, storage).
 #![forbid(unsafe_code)]
 #![cfg_attr(
     test,

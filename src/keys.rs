@@ -28,7 +28,7 @@ const ID_LEN: usize = 16;
 const WRAPPED_LEN: usize = NONCE_LEN + KEY_LEN + TAG_LEN;
 /// Total serialized header size.
 pub const HEADER_LEN: usize = 4 + 1 + ID_LEN + PARAMS_LEN + WRAPPED_LEN * 2;
-const DB_KEY_LABEL: &[u8] = b"truevault/db-key/v1";
+const DB_KEY_LABEL: &[u8] = b"vault/db-key/v1";
 
 /// A random per-device key that unwraps the data key from a device-local wrap blob.
 /// Zeroized on drop; `Debug` is redacted; not `Clone`.
