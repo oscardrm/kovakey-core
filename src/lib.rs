@@ -28,5 +28,6 @@ pub mod strength;
 pub mod tagger;
 pub mod totp;
 pub mod vault_file;
+pub mod wifi;
 
 pub use error::{Error, Result};

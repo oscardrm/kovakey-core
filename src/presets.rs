@@ -135,6 +135,34 @@ pub const PRESETS: &[Preset] = &[
         ],
     },
     Preset {
+        key: "wifi",
+        name: "Wi-Fi",
+        icon: "wifi",
+        color: "#0EA5E9",
+        icon_color: "#FFFFFF",
+        // Order matters for the QR export (see `crate::wifi`): network name = first text input,
+        // security = second text input, password = first password input.
+        fields: &[
+            f("ssid", "Network name", InputKind::Text, true),
+            f("password", "Password", InputKind::Password, true),
+            f("security", "Security", InputKind::Text, false),
+        ],
+    },
+    Preset {
+        key: "software_license",
+        name: "Software License",
+        icon: "key.horizontal",
+        color: "#EC4899",
+        icon_color: "#FFFFFF",
+        fields: &[
+            f("product", "Product", InputKind::Text, false),
+            f("license_key", "License key", InputKind::Key, false),
+            f("licensed_to", "Licensed to", InputKind::Text, false),
+            f("purchase_date", "Purchase date", InputKind::Date, false),
+            f("expiry", "Expiry", InputKind::Date, false),
+        ],
+    },
+    Preset {
         key: "note",
         name: "Notes",
         icon: "note.text",

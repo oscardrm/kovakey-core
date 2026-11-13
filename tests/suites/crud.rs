@@ -675,6 +675,45 @@ fn card(d: &Store) -> vault_core::models::Category {
         .unwrap()
 }
 
+#[test]
+fn wifi_and_software_license_presets_are_seeded_with_their_templates() {
+    let mut d = db();
+    d.seed_default_categories(&ctx("dev-a", 100)).unwrap();
+    let kinds = |preset: &str| -> Vec<(String, bool)> {
+        let cat = d
+            .list_categories()
+            .unwrap()
+            .into_iter()
+            .find(|c| c.preset.as_deref() == Some(preset))
+            .unwrap();
+        d.list_category_fields(&cat.id)
+            .unwrap()
+            .into_iter()
+            .map(|f| (f.kind, f.is_core))
+            .collect()
+    };
+    let t = |k: &str, core: bool| (k.to_string(), core);
+    // Network name and password are core: the QR export depends on them.
+    assert_eq!(
+        kinds("wifi"),
+        [t("text", true), t("password", true), t("text", false)]
+    );
+    assert_eq!(
+        kinds("software_license"),
+        [
+            t("text", false),
+            t("key", false),
+            t("text", false),
+            t("date", false),
+            t("date", false)
+        ]
+    );
+    // Re-seeding adds nothing.
+    let before = d.list_categories().unwrap().len();
+    d.seed_default_categories(&ctx("dev-a", 200)).unwrap();
+    assert_eq!(d.list_categories().unwrap().len(), before);
+}
+
 /// The category's template as inputs targeting the existing fields (an unchanged edit).
 fn template(d: &Store, cat: &str) -> Vec<CategoryFieldInput> {
     d.list_category_fields(cat)
