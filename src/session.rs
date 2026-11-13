@@ -237,8 +237,9 @@ impl<S: VaultStore> Session<S> {
 
     /// Global search across the whole vault: every term must occur in an item's title, URL, tag
     /// or **non-secret** field value (e.g. a username or email). Hits are grouped by category in
-    /// category display order, uncategorized last. A blank query returns no groups.
-    pub fn search_grouped(&self, query: &str) -> Result<Vec<SearchGroup>> {
+    /// category display order, uncategorized last. A blank query returns no groups. `vault_id`
+    /// limits the search to one vault (`None` = every vault).
+    pub fn search_grouped(&self, query: &str, vault_id: Option<&str>) -> Result<Vec<SearchGroup>> {
         let terms = split_terms(query);
         if terms.is_empty() {
             return Ok(Vec::new());
@@ -246,6 +247,9 @@ impl<S: VaultStore> Session<S> {
         let store = self.store()?;
         let mut hits = Vec::new();
         for summary in store.list_items()? {
+            if vault_id.is_some_and(|v| summary.vault_id != v) {
+                continue;
+            }
             let values: Vec<String> = store
                 .get_item(&summary.id)?
                 .fields
@@ -923,6 +927,7 @@ mod tests {
                         item_type: ItemType::Credential,
                         title: "Mail".into(),
                         url: None,
+                        vault_id: None,
                         category_id: None,
                         color: None,
                         favorite: false,
@@ -935,11 +940,11 @@ mod tests {
                 )
             })
             .unwrap();
-        let g = s.search_grouped("me@example").unwrap();
+        let g = s.search_grouped("me@example", None).unwrap();
         assert_eq!(g.len(), 1);
         assert_eq!(g[0].items[0].id, id);
-        assert!(s.search_grouped("hunter2").unwrap().is_empty());
-        assert!(s.search_grouped("  ").unwrap().is_empty());
+        assert!(s.search_grouped("hunter2", None).unwrap().is_empty());
+        assert!(s.search_grouped("  ", None).unwrap().is_empty());
     }
 
     #[test]

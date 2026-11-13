@@ -21,7 +21,7 @@ use std::collections::BTreeMap;
 
 use crate::models::{
     Category, CategoryField, Item, ItemField, ItemTag, NoteBlock, NoteImage, Snapshot, Tag,
-    VaultMeta,
+    VaultMeta, DEFAULT_VAULT_ID,
 };
 
 /// A record that participates in LWW merge.
@@ -78,9 +78,60 @@ fn merge_images(a: &[NoteImage], b: &[NoteImage]) -> Vec<NoteImage> {
     map.into_values().cloned().collect()
 }
 
+/// Concurrent edits can leave an item in a vault that another device deleted. Make the result
+/// consistent without bumping any timestamp (so later merges stay convergent): items of a missing
+/// or deleted vault move to the default vault if it is live, else to the first live vault by
+/// (creation time, id). If every vault was deleted, the default vault is revived (its tombstone is
+/// dropped) so the account always has one.
+fn heal_vaults(s: &mut Snapshot) {
+    let mut live: Vec<(i64, &str)> = s
+        .vault_meta
+        .iter()
+        .filter(|v| v.deleted_at.is_none())
+        .map(|v| (v.created_at, v.id.as_str()))
+        .collect();
+    if live.is_empty() {
+        let revived = s.vault_meta.iter_mut().find(|v| v.id == DEFAULT_VAULT_ID);
+        if let Some(v) = revived {
+            v.deleted_at = None;
+        } else if s.items.iter().any(|i| i.deleted_at.is_none()) {
+            s.vault_meta.push(VaultMeta {
+                id: DEFAULT_VAULT_ID.to_string(),
+                name: "Personal".to_string(),
+                color: "#2563EB".to_string(),
+                badge: None,
+                created_at: 0,
+                updated_at: 0,
+                updated_by: String::new(),
+                deleted_at: None,
+            });
+        }
+        live = s
+            .vault_meta
+            .iter()
+            .filter(|v| v.deleted_at.is_none())
+            .map(|v| (v.created_at, v.id.as_str()))
+            .collect();
+    }
+    live.sort_unstable();
+    let ids: std::collections::BTreeSet<String> =
+        live.iter().map(|(_, i)| (*i).to_string()).collect();
+    let target = if ids.contains(DEFAULT_VAULT_ID) {
+        Some(DEFAULT_VAULT_ID.to_string())
+    } else {
+        live.first().map(|(_, i)| (*i).to_string())
+    };
+    let Some(target) = target else { return };
+    for item in &mut s.items {
+        if !ids.contains(&item.vault_id) {
+            item.vault_id = target.clone();
+        }
+    }
+}
+
 /// Merge two vault snapshots.
 pub fn merge(local: &Snapshot, remote: &Snapshot) -> Snapshot {
-    Snapshot {
+    let mut merged = Snapshot {
         vault_meta: merge_records(&local.vault_meta, &remote.vault_meta),
         categories: merge_records(&local.categories, &remote.categories),
         category_fields: merge_records(&local.category_fields, &remote.category_fields),
@@ -90,7 +141,9 @@ pub fn merge(local: &Snapshot, remote: &Snapshot) -> Snapshot {
         item_tags: merge_records(&local.item_tags, &remote.item_tags),
         note_blocks: merge_records(&local.note_blocks, &remote.note_blocks),
         note_images: merge_images(&local.note_images, &remote.note_images),
-    }
+    };
+    heal_vaults(&mut merged);
+    merged
 }
 
 /// Largest amount (ms) by which any record's `updated_at` exceeds `now_ms`; 0 if none do.
@@ -174,6 +227,7 @@ mod tests {
     fn item(id: &str, body: &str, t: i64, dev: &str, del: Option<i64>) -> Item {
         Item {
             id: id.into(),
+            vault_id: "default".into(),
             category_id: None,
             item_type: ItemType::Credential,
             title: body.into(),

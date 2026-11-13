@@ -28,6 +28,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/002_sync_columns.sql"),
     include_str!("migrations/003_category_fields.sql"),
     include_str!("migrations/004_trash.sql"),
+    include_str!("migrations/005_vaults.sql"),
 ];
 
 /// Latest schema version known to this build.
@@ -183,6 +184,12 @@ mod tests {
             assert_eq!(snap.items.len(), 1);
             assert_eq!(snap.item_fields.len(), 1);
             assert_eq!(snap.item_tags.len(), 1);
+            // Pre-vault data lands in the fixed default vault, which exists after migrating.
+            assert_eq!(snap.items[0].vault_id, "default");
+            assert!(snap
+                .vault_meta
+                .iter()
+                .any(|v| v.id == "default" && v.deleted_at.is_none()));
         }
     }
 

@@ -141,11 +141,13 @@ fn existing_keys<S: VaultStore>(store: &S) -> Result<HashSet<DuplicateKey>> {
 
 /// Write `items` into the vault. With `skip_duplicates`, items matching an existing one (or an
 /// earlier item of the list) are left out. A failing item is counted and does not abort the rest.
+/// `vault_id` is the vault the items go to (`None` = the default vault).
 pub fn import_items<S: VaultStore>(
     store: &mut S,
     ctx: &WriteCtx<'_>,
     items: &[ImportItem],
     skip_duplicates: bool,
+    vault_id: Option<&str>,
 ) -> Result<ImportReport> {
     let mut report = ImportReport::default();
     let mut seen = if skip_duplicates {
@@ -165,7 +167,15 @@ pub fn import_items<S: VaultStore>(
             .iter()
             .find(|c| c.preset.as_deref() == Some(item.preset_key.as_str()))
             .map(|c| c.id.clone());
-        match write_item(store, ctx, item, category_id, &mut tags, &mut report) {
+        match write_item(
+            store,
+            ctx,
+            item,
+            category_id,
+            vault_id,
+            &mut tags,
+            &mut report,
+        ) {
             Ok(()) => report.imported += 1,
             Err(_) => report.failed += 1,
         }
@@ -178,12 +188,14 @@ fn write_item<S: VaultStore>(
     ctx: &WriteCtx<'_>,
     item: &ImportItem,
     category_id: Option<String>,
+    vault_id: Option<&str>,
     tags: &mut Vec<crate::models::Tag>,
     report: &mut ImportReport,
 ) -> Result<()> {
     let mut new = NewItem::new(item.item_type, &item.title);
     new.url = item.url.clone();
     new.category_id = category_id;
+    new.vault_id = vault_id.map(str::to_string);
     new.favorite = item.favorite;
     new.fields = item.fields.clone();
     if !item.note.trim().is_empty() {

@@ -73,6 +73,7 @@ fn with_meta(mut s: Snapshot) -> Snapshot {
         created_at: 1,
         updated_at: 1,
         updated_by: "dev-a".into(),
+        deleted_at: None,
     });
     s
 }
@@ -126,7 +127,16 @@ fn save_snapshot_rolls_back_everything_when_a_foreign_key_dangles() {
 
     let mut dst = db();
     assert_eq!(dst.save_snapshot(&snap), Err(Error::Database));
-    assert_eq!(dst.load_snapshot().unwrap(), Snapshot::default());
+    // Rolled back: only the default vault that every fresh database starts with remains.
+    let after = dst.load_snapshot().unwrap();
+    assert_eq!(after.vault_meta.len(), 1);
+    assert_eq!(
+        after,
+        Snapshot {
+            vault_meta: after.vault_meta.clone(),
+            ..Snapshot::default()
+        }
+    );
 }
 
 #[test]

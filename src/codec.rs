@@ -7,7 +7,7 @@ use crate::models::{NoteImage, Snapshot};
 use crate::side_blob::{is_external, sha256_hex};
 
 /// Current snapshot payload format version.
-pub const SNAPSHOT_FORMAT_VERSION: u8 = 3;
+pub const SNAPSHOT_FORMAT_VERSION: u8 = 4;
 
 /// Result of [`encode_snapshot`].
 pub struct EncodedSnapshot<'a> {
@@ -22,7 +22,8 @@ pub type ImageResolver<'a> = dyn FnMut(&str, u64) -> Result<Zeroizing<Vec<u8>>> 
 
 /// Serialize `snapshot` at [`SNAPSHOT_FORMAT_VERSION`] (v2 = the frozen v1 payload followed by
 /// the category extension: preset keys and category field templates; v3 appends the Trash
-/// extension: the trash time of each trashed item).
+/// extension: the trash time of each trashed item; v4 appends the Vaults extension: each item's
+/// vault and the tombstone time of deleted vaults).
 ///
 /// Image `sha256`/`size` are verified against the bytes (ADR 0001: never trusted on save);
 /// a mismatch is [`Error::InvalidInput`]. Images above the side-blob threshold are replaced by a
@@ -44,6 +45,11 @@ fn encode_at(snapshot: &Snapshot, version: u8) -> Result<EncodedSnapshot<'_>> {
         let tail = postcard::to_allocvec(&ext).map_err(|_| Error::Corrupted)?;
         bytes.extend_from_slice(&tail);
     }
+    if version >= 4 {
+        let ext = v4::Ext::from_snapshot(snapshot);
+        let tail = postcard::to_allocvec(&ext).map_err(|_| Error::Corrupted)?;
+        bytes.extend_from_slice(&tail);
+    }
     Ok(EncodedSnapshot {
         payload: Zeroizing::new(bytes),
         external,
@@ -62,7 +68,7 @@ pub fn decode_snapshot(
 ) -> Result<Snapshot> {
     match version {
         1 => v1::decode(bytes, resolve),
-        2 | 3 => {
+        2..=4 => {
             let (mut snap, rest) = v1::decode_prefix(bytes, resolve)?;
             let (ext, rest) =
                 postcard::take_from_bytes::<v2::Ext>(rest).map_err(|_| Error::Corrupted)?;
@@ -71,6 +77,14 @@ pub fn decode_snapshot(
                 let (trash, rest) =
                     postcard::take_from_bytes::<v3::Ext>(rest).map_err(|_| Error::Corrupted)?;
                 trash.apply(&mut snap)?;
+                rest
+            } else {
+                rest
+            };
+            let rest = if version >= 4 {
+                let (vaults, rest) =
+                    postcard::take_from_bytes::<v4::Ext>(rest).map_err(|_| Error::Corrupted)?;
+                vaults.apply(&mut snap)?;
                 rest
             } else {
                 rest
@@ -89,14 +103,14 @@ pub fn decode_snapshot(
 pub fn external_image_refs(version: u8, bytes: &[u8]) -> Result<Vec<(String, u64)>> {
     match version {
         1 => v1::external_refs(bytes),
-        2 | 3 => v1::external_refs_prefix(bytes),
+        2..=4 => v1::external_refs_prefix(bytes),
         _ => Err(Error::UnsupportedVersion),
     }
 }
 
 /// Whether this build can decode `version`.
 pub fn is_supported_version(version: u8) -> bool {
-    matches!(version, 1..=3)
+    matches!(version, 1..=4)
 }
 
 /// Wire format v1. **Frozen**: postcard is not self-describing, so any change to these types
@@ -116,7 +130,7 @@ mod v1 {
     use crate::error::{Error, Result};
     use crate::models::{
         BlockKind, Category, HistoryEntry, Item, ItemField, ItemTag, ItemType, NoteBlock,
-        NoteImage, Snapshot, Tag, VaultMeta,
+        NoteImage, Snapshot, Tag, VaultMeta, DEFAULT_VAULT_ID,
     };
 
     #[derive(Serialize, Deserialize, Zeroize)]
@@ -415,6 +429,7 @@ mod v1 {
                     created_at: v.created_at,
                     updated_at: v.updated_at,
                     updated_by: take(&mut v.updated_by),
+                    deleted_at: None,
                 });
             }
             for c in &mut self.categories {
@@ -456,6 +471,7 @@ mod v1 {
                     .collect();
                 snap.items.push(Item {
                     id: take(&mut i.id),
+                    vault_id: DEFAULT_VAULT_ID.to_string(),
                     category_id: i.category_id.take(),
                     item_type: ItemType::parse(&i.item_type)?,
                     title: take(&mut i.title),
@@ -805,6 +821,7 @@ pub(crate) mod fixtures {
                 created_at: 1_700_000_000_000,
                 updated_at: 1_700_000_001_000,
                 updated_by: "dev-a".into(),
+                deleted_at: None,
             }],
             categories: vec![Category {
                 id: "cat-1".into(),
@@ -831,6 +848,7 @@ pub(crate) mod fixtures {
             items: vec![
                 Item {
                     id: "item-1".into(),
+                    vault_id: "default".into(),
                     category_id: Some("cat-1".into()),
                     item_type: ItemType::Credential,
                     title: "Example".into(),
@@ -851,6 +869,7 @@ pub(crate) mod fixtures {
                 },
                 Item {
                     id: "item-2".into(),
+                    vault_id: "default".into(),
                     category_id: None,
                     item_type: ItemType::Note,
                     title: "Note".into(),
@@ -900,6 +919,81 @@ pub(crate) mod fixtures {
                 deleted_at: None,
             }],
             note_images: images,
+        }
+    }
+}
+
+/// Wire format v4 extension (appended after v3): the vault of every item that is not in the
+/// default vault, and the tombstone time of deleted vaults. Payloads written before v4 decode
+/// with every item in the default vault.
+mod v4 {
+    use serde::{Deserialize, Serialize};
+
+    use crate::error::{Error, Result};
+    use crate::models::{Snapshot, DEFAULT_VAULT_ID};
+
+    #[derive(Serialize, Deserialize)]
+    pub(super) struct ItemVaultW {
+        pub(super) item_id: String,
+        pub(super) vault_id: String,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    pub(super) struct VaultDeletedW {
+        pub(super) vault_id: String,
+        pub(super) deleted_at: i64,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    pub struct Ext {
+        pub(super) item_vaults: Vec<ItemVaultW>,
+        pub(super) deleted_vaults: Vec<VaultDeletedW>,
+    }
+
+    impl Ext {
+        pub fn from_snapshot(s: &Snapshot) -> Self {
+            Self {
+                item_vaults: s
+                    .items
+                    .iter()
+                    .filter(|i| i.vault_id != DEFAULT_VAULT_ID)
+                    .map(|i| ItemVaultW {
+                        item_id: i.id.clone(),
+                        vault_id: i.vault_id.clone(),
+                    })
+                    .collect(),
+                deleted_vaults: s
+                    .vault_meta
+                    .iter()
+                    .filter_map(|v| {
+                        v.deleted_at.map(|t| VaultDeletedW {
+                            vault_id: v.id.clone(),
+                            deleted_at: t,
+                        })
+                    })
+                    .collect(),
+            }
+        }
+
+        pub fn apply(self, snap: &mut Snapshot) -> Result<()> {
+            for w in self.item_vaults {
+                // A reference to an unknown item means the payload is damaged.
+                let item = snap
+                    .items
+                    .iter_mut()
+                    .find(|i| i.id == w.item_id)
+                    .ok_or(Error::Corrupted)?;
+                item.vault_id = w.vault_id;
+            }
+            for w in self.deleted_vaults {
+                let v = snap
+                    .vault_meta
+                    .iter_mut()
+                    .find(|v| v.id == w.vault_id)
+                    .ok_or(Error::Corrupted)?;
+                v.deleted_at = Some(w.deleted_at);
+            }
+            Ok(())
         }
     }
 }
@@ -1023,7 +1117,7 @@ mod tests {
     fn unknown_versions_are_rejected_before_parsing() {
         let snap = sample(false);
         let enc = encode_snapshot(&snap).unwrap();
-        for v in [0u8, 4, 255] {
+        for v in [0u8, 5, 255] {
             let r = decode_snapshot(v, &enc.payload, &mut no_resolver());
             assert_eq!(r.err(), Some(Error::UnsupportedVersion), "v{v}");
         }
@@ -1076,6 +1170,31 @@ mod tests {
         s
     }
 
+    const GOLDEN_V4: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/snapshot_v4.postcard"
+    );
+
+    /// The v3 sample with `item-2` moved to a non-default vault and one deleted vault (what the v4
+    /// golden file pins).
+    fn vaulted_sample(big: bool) -> Snapshot {
+        let mut s = trashed_sample(big);
+        if let Some(i) = s.items.iter_mut().find(|i| i.id == "item-2") {
+            i.vault_id = "vault-1".into();
+        }
+        s.vault_meta.push(crate::models::VaultMeta {
+            id: "vault-old".into(),
+            name: "Old".into(),
+            color: "#445566".into(),
+            badge: None,
+            created_at: 1_700_000_000_500,
+            updated_at: 1_700_000_009_000,
+            updated_by: "dev-b".into(),
+            deleted_at: Some(1_700_000_009_000),
+        });
+        s
+    }
+
     /// Regenerate with `TV_REGEN_GOLDEN=1 cargo test -p vault-core regenerate_snapshot_golden -- --ignored`.
     /// Only do that when intentionally adding a new format version. (v1 and v2 are frozen: never
     /// regenerate them; only the current version's file may be written.)
@@ -1085,9 +1204,9 @@ mod tests {
         if std::env::var("TV_REGEN_GOLDEN").is_err() {
             return;
         }
-        let snap = trashed_sample(true);
+        let snap = vaulted_sample(true);
         let enc = encode_snapshot(&snap).unwrap();
-        std::fs::write(GOLDEN_V3, &*enc.payload).unwrap();
+        std::fs::write(GOLDEN_V4, &*enc.payload).unwrap();
     }
 
     fn big_resolver(h: &str, size: u64) -> Result<Zeroizing<Vec<u8>>> {
@@ -1133,10 +1252,34 @@ mod tests {
     }
 
     #[test]
-    fn current_encoder_still_produces_the_golden_v3_bytes() {
+    fn v3_encoder_still_produces_the_golden_v3_bytes() {
         let bytes = std::fs::read(GOLDEN_V3).unwrap();
         let snap = trashed_sample(true);
+        assert_eq!(*encode_at(&snap, 3).unwrap().payload, bytes);
+    }
+
+    #[test]
+    fn golden_v4_blob_decodes_to_the_expected_snapshot() {
+        let bytes = std::fs::read(GOLDEN_V4).unwrap();
+        let out = decode_snapshot(4, &bytes, &mut big_resolver).unwrap();
+        assert_eq!(out, vaulted_sample(true));
+    }
+
+    #[test]
+    fn current_encoder_still_produces_the_golden_v4_bytes() {
+        let bytes = std::fs::read(GOLDEN_V4).unwrap();
+        let snap = vaulted_sample(true);
         assert_eq!(*encode_snapshot(&snap).unwrap().payload, bytes);
+    }
+
+    #[test]
+    fn v4_round_trips_vaults_and_v3_puts_everything_in_the_default_vault() {
+        let snap = vaulted_sample(false);
+        assert_eq!(round_trip(&snap), snap);
+        let v3 =
+            decode_snapshot(3, &encode_at(&snap, 3).unwrap().payload, &mut no_resolver()).unwrap();
+        assert!(v3.items.iter().all(|i| i.vault_id == "default"));
+        assert!(v3.vault_meta.iter().all(|v| v.deleted_at.is_none()));
     }
 
     #[test]

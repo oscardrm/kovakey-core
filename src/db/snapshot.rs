@@ -40,7 +40,7 @@ fn query<T>(
 fn read_all(conn: &Connection) -> Result<Snapshot> {
     let vault_meta = query(
         conn,
-        "SELECT id,name,color,badge,created_at,updated_at,updated_by FROM vault_meta ORDER BY id",
+        "SELECT id,name,color,badge,created_at,updated_at,updated_by,deleted_at FROM vault_meta ORDER BY id",
         |r| {
             Ok(VaultMeta {
                 id: r.get(0)?,
@@ -50,6 +50,7 @@ fn read_all(conn: &Connection) -> Result<Snapshot> {
                 created_at: r.get(4)?,
                 updated_at: r.get(5)?,
                 updated_by: r.get(6)?,
+                deleted_at: r.get(7)?,
             })
         },
     )?;
@@ -110,12 +111,13 @@ fn read_all(conn: &Connection) -> Result<Snapshot> {
     let mut items = query(
         conn,
         "SELECT id,category_id,item_type,title,url,color,favorite,use_count,last_used_at,
-                created_at,updated_at,updated_by,deleted_at,trashed_at
+                created_at,updated_at,updated_by,deleted_at,trashed_at,vault_id
          FROM items ORDER BY id",
         |r| {
             let ty: String = r.get(2)?;
             Ok(Item {
                 id: r.get(0)?,
+                vault_id: r.get(14)?,
                 category_id: r.get(1)?,
                 item_type: ItemType::parse(&ty).map_err(|e| corrupt(2, e))?,
                 title: r.get(3)?,
@@ -255,13 +257,23 @@ fn write_all(conn: &Connection, snap: &Snapshot) -> Result<()> {
     }
     for v in &snap.vault_meta {
         conn.execute(
-            "INSERT INTO vault_meta(id,name,color,badge,created_at,updated_at,updated_by)
-             VALUES(?1,?2,?3,?4,?5,?6,?7)
+            "INSERT INTO vault_meta(id,name,color,badge,created_at,updated_at,updated_by,deleted_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8)
              ON CONFLICT(id) DO UPDATE SET name=excluded.name,color=excluded.color,
                badge=excluded.badge,created_at=excluded.created_at,
-               updated_at=excluded.updated_at,updated_by=excluded.updated_by
+               updated_at=excluded.updated_at,updated_by=excluded.updated_by,
+               deleted_at=excluded.deleted_at
              WHERE (excluded.updated_at,excluded.updated_by) >= (vault_meta.updated_at,vault_meta.updated_by)",
-            params![v.id, v.name, v.color, v.badge, v.created_at, v.updated_at, v.updated_by],
+            params![
+                v.id,
+                v.name,
+                v.color,
+                v.badge,
+                v.created_at,
+                v.updated_at,
+                v.updated_by,
+                v.deleted_at
+            ],
         )
         .map_err(db_err)?;
     }
@@ -322,9 +334,9 @@ fn write_all(conn: &Connection, snap: &Snapshot) -> Result<()> {
         // Usage counters are monotone: keep the max of stored and incoming values.
         conn.execute(
             "INSERT INTO items(id,category_id,item_type,title,url,color,favorite,use_count,last_used_at,
-                               created_at,updated_at,updated_by,deleted_at,trashed_at)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)
-             ON CONFLICT(id) DO UPDATE SET category_id=excluded.category_id,
+                               created_at,updated_at,updated_by,deleted_at,trashed_at,vault_id)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)
+             ON CONFLICT(id) DO UPDATE SET category_id=excluded.category_id,vault_id=excluded.vault_id,
                item_type=excluded.item_type,title=excluded.title,url=excluded.url,
                color=excluded.color,favorite=excluded.favorite,
                use_count=max(items.use_count,excluded.use_count),
@@ -349,7 +361,8 @@ fn write_all(conn: &Connection, snap: &Snapshot) -> Result<()> {
                 i.updated_at,
                 i.updated_by,
                 i.deleted_at,
-                i.trashed_at
+                i.trashed_at,
+                i.vault_id
             ],
         )
         .map_err(db_err)?;

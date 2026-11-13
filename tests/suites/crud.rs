@@ -2,6 +2,7 @@ use super::common::{ctx, login};
 use vault_core::db::{
     BlockInput, CategoryFieldInput, CategoryUpdate, FieldInput, ItemUpdate, NewCategory, NewItem, VaultStore,
 };
+use vault_core::ops::VaultUpdate;
 use vault_core::models::{BlockKind, InputKind, ItemType};
 use vault_core::Error;
 
@@ -656,7 +657,14 @@ fn invalid_input_is_rejected_without_side_effects() {
         Err(Error::InvalidInput)
     );
     assert!(d.list_items().unwrap().is_empty());
-    assert_eq!(d.snapshot().unwrap(), Default::default());
+    // Nothing was written; only the default vault exists.
+    let snap = d.snapshot().unwrap();
+    assert_eq!(snap.vault_meta.len(), 1);
+    let expected = vault_core::models::Snapshot {
+        vault_meta: snap.vault_meta.clone(),
+        ..Default::default()
+    };
+    assert_eq!(snap, expected);
 }
 
 #[test]
@@ -882,4 +890,141 @@ fn category_templates_survive_snapshot_merge() {
         b.list_category_fields(&c.id).unwrap().len(),
         a.list_category_fields(&c.id).unwrap().len()
     );
+}
+
+// ---- vaults -------------------------------------------------------------------------------
+
+fn vault_of(d: &Store, item: &str) -> String {
+    d.get_item(item).unwrap().summary.vault_id
+}
+
+#[test]
+fn a_new_store_has_the_default_vault_and_items_land_in_it() {
+    let mut d = db();
+    d.seed_default_categories(&ctx("dev-a", 50)).unwrap();
+    let vaults = d.list_vaults().unwrap();
+    assert_eq!(vaults.len(), 1);
+    assert_eq!(vaults[0].id, "default");
+    let id = login(&mut d, "dev-a", 100, "Mail", "fake");
+    assert_eq!(vault_of(&d, &id), "default");
+    // Seeding again never duplicates it.
+    d.seed_default_categories(&ctx("dev-a", 60)).unwrap();
+    assert_eq!(d.list_vaults().unwrap().len(), 1);
+}
+
+#[test]
+fn vaults_are_created_updated_and_validated() {
+    let mut d = db();
+    let work = d.create_vault(&ctx("dev-a", 100), "  Work ", "#10B981", Some("W")).unwrap();
+    assert_eq!((work.name.as_str(), work.badge.as_deref()), ("Work", Some("W")));
+    // Default first, then by creation time.
+    let ids: Vec<String> = d.list_vaults().unwrap().into_iter().map(|v| v.id).collect();
+    assert_eq!(ids, vec!["default".to_string(), work.id.clone()]);
+
+    for (name, color) in [("", "#000000"), ("work", "#000000"), ("X", "red"), ("Bad\nname", "#000000")] {
+        assert_eq!(d.create_vault(&ctx("dev-a", 110), name, color, None).err(), Some(Error::InvalidInput), "{name}/{color}");
+    }
+    assert_eq!(d.create_vault(&ctx("dev-a", 110), "X", "#000000", Some("12345")).err(), Some(Error::InvalidInput));
+
+    let u = d
+        .update_vault(&ctx("dev-a", 200), &work.id, &VaultUpdate { name: Some("Clients".into()), badge: Some(None), ..Default::default() })
+        .unwrap();
+    assert_eq!((u.name.as_str(), u.badge), ("Clients", None));
+    assert!(u.updated_at > work.updated_at);
+    // No-op update keeps the timestamp; clash and unknown id are rejected.
+    let same = d.update_vault(&ctx("dev-a", 300), &work.id, &VaultUpdate { name: Some("Clients".into()), ..Default::default() }).unwrap();
+    assert_eq!(same.updated_at, u.updated_at);
+    assert_eq!(
+        d.update_vault(&ctx("dev-a", 400), &work.id, &VaultUpdate { name: Some("PERSONAL".into()), ..Default::default() }).err(),
+        Some(Error::InvalidInput)
+    );
+    assert_eq!(d.update_vault(&ctx("dev-a", 400), "nope", &VaultUpdate::default()).err(), Some(Error::NotFound));
+}
+
+#[test]
+fn items_are_created_in_and_moved_between_vaults() {
+    let mut d = db();
+    let work = d.create_vault(&ctx("dev-a", 100), "Work", "#10B981", None).unwrap();
+    let mut new = NewItem::new(ItemType::Credential, "Jira");
+    new.vault_id = Some(work.id.clone());
+    let id = d.create_item(&ctx("dev-a", 200), &new).unwrap();
+    assert_eq!(vault_of(&d, &id), work.id);
+
+    let mut bad = NewItem::new(ItemType::Credential, "X");
+    bad.vault_id = Some("nope".into());
+    assert_eq!(d.create_item(&ctx("dev-a", 210), &bad).err(), Some(Error::NotFound));
+
+    let before = d.get_item(&id).unwrap().summary.updated_at;
+    d.update_item(&ctx("dev-a", 300), &id, &ItemUpdate { vault_id: Some("default".into()), ..Default::default() }).unwrap();
+    assert_eq!(vault_of(&d, &id), "default");
+    assert!(d.get_item(&id).unwrap().summary.updated_at > before);
+    assert_eq!(
+        d.update_item(&ctx("dev-a", 310), &id, &ItemUpdate { vault_id: Some("nope".into()), ..Default::default() }).err(),
+        Some(Error::NotFound)
+    );
+    assert_eq!(vault_of(&d, &id), "default");
+}
+
+#[test]
+fn deleting_a_vault_moves_its_items_including_trashed_ones() {
+    let mut d = db();
+    let work = d.create_vault(&ctx("dev-a", 100), "Work", "#10B981", None).unwrap();
+    let mk = |d: &mut Store, t: &str, now: i64| {
+        let mut n = NewItem::new(ItemType::Credential, t);
+        n.vault_id = Some(work.id.clone());
+        d.create_item(&ctx("dev-a", now), &n).unwrap()
+    };
+    let live = mk(&mut d, "Live", 200);
+    let trashed = mk(&mut d, "Trashed", 210);
+    d.trash_item(&ctx("dev-a", 220), &trashed).unwrap();
+
+    assert_eq!(d.delete_vault(&ctx("dev-a", 300), &work.id, &work.id).err(), Some(Error::InvalidInput));
+    assert_eq!(d.delete_vault(&ctx("dev-a", 300), &work.id, "nope").err(), Some(Error::NotFound));
+    d.delete_vault(&ctx("dev-a", 300), &work.id, "default").unwrap();
+
+    assert_eq!(d.list_vaults().unwrap().len(), 1);
+    assert_eq!(vault_of(&d, &live), "default");
+    let t = d.list_trashed_items().unwrap();
+    assert_eq!(t.len(), 1);
+    assert_eq!(t[0].vault_id, "default");
+    // A deleted vault cannot be edited, used or deleted again.
+    assert_eq!(d.update_vault(&ctx("dev-a", 400), &work.id, &VaultUpdate::default()).err(), Some(Error::NotFound));
+    assert_eq!(d.delete_vault(&ctx("dev-a", 400), &work.id, "default").err(), Some(Error::NotFound));
+    let mut n = NewItem::new(ItemType::Credential, "X");
+    n.vault_id = Some(work.id.clone());
+    assert_eq!(d.create_item(&ctx("dev-a", 410), &n).err(), Some(Error::NotFound));
+    // Its name is free again.
+    d.create_vault(&ctx("dev-a", 500), "Work", "#10B981", None).unwrap();
+}
+
+#[test]
+fn vaults_and_item_moves_merge_between_devices() {
+    let mut a = db();
+    let mut b = db();
+    a.seed_default_categories(&ctx("dev-a", 10)).unwrap();
+    b.seed_default_categories(&ctx("dev-b", 10)).unwrap();
+    let work = a.create_vault(&ctx("dev-a", 100), "Work", "#10B981", None).unwrap();
+    let id = login(&mut a, "dev-a", 110, "Mail", "fake");
+    a.update_item(&ctx("dev-a", 120), &id, &ItemUpdate { vault_id: Some(work.id.clone()), ..Default::default() }).unwrap();
+
+    b.merge_remote(&a.snapshot().unwrap()).unwrap();
+    assert_eq!(b.list_vaults().unwrap().len(), 2);
+    assert_eq!(vault_of(&b, &id), work.id);
+    // Both devices created the default vault independently: still exactly one.
+    assert_eq!(b.list_vaults().unwrap().iter().filter(|v| v.id == "default").count(), 1);
+
+    // B deletes the vault; A keeps working in it concurrently. Nothing is orphaned after merging.
+    b.delete_vault(&ctx("dev-b", 200), &work.id, "default").unwrap();
+    let mut n = NewItem::new(ItemType::Credential, "Late");
+    n.vault_id = Some(work.id.clone());
+    let late = a.create_item(&ctx("dev-a", 210), &n).unwrap();
+    a.merge_remote(&b.snapshot().unwrap()).unwrap();
+    b.merge_remote(&a.snapshot().unwrap()).unwrap();
+    for s in [a.snapshot().unwrap(), b.snapshot().unwrap()] {
+        assert!(s.items.iter().filter(|i| i.deleted_at.is_none()).all(|i| i.vault_id == "default"), "{:?}", s.items.iter().map(|i| &i.vault_id).collect::<Vec<_>>());
+    }
+    assert_eq!(vault_of(&a, &late), "default");
+    assert_eq!(vault_of(&b, &late), "default");
+    assert_eq!(a.list_vaults().unwrap().len(), 1);
+    assert_eq!(b.list_vaults().unwrap().len(), 1);
 }

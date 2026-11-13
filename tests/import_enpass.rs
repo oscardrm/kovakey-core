@@ -94,7 +94,7 @@ macro_rules! store_tests {
             fn import_writes_items_tags_category_and_history() {
                 let mut d = seeded();
                 let p = enpass::parse_json(EXPORT.as_bytes()).unwrap();
-                let r = import_items(&mut d, &ctx("dev-a", 1_000), &p.items, true).unwrap();
+                let r = import_items(&mut d, &ctx("dev-a", 1_000), &p.items, true, None).unwrap();
                 assert_eq!((r.imported, r.skipped_duplicates, r.failed), (3, 0, 0));
                 assert_eq!(r.tags_created, 1);
 
@@ -124,14 +124,14 @@ macro_rules! store_tests {
             fn second_import_skips_duplicates_unless_told_otherwise() {
                 let mut d = seeded();
                 let p = enpass::parse_json(EXPORT.as_bytes()).unwrap();
-                import_items(&mut d, &ctx("dev-a", 1_000), &p.items, true).unwrap();
+                import_items(&mut d, &ctx("dev-a", 1_000), &p.items, true, None).unwrap();
                 assert_eq!(find_duplicates(&d, &p.items).unwrap(), vec![0, 1, 2]);
 
-                let r = import_items(&mut d, &ctx("dev-a", 2_000), &p.items, true).unwrap();
+                let r = import_items(&mut d, &ctx("dev-a", 2_000), &p.items, true, None).unwrap();
                 assert_eq!((r.imported, r.skipped_duplicates), (0, 3));
                 assert_eq!(d.list_items().unwrap().len(), 3);
 
-                let r = import_items(&mut d, &ctx("dev-a", 3_000), &p.items, false).unwrap();
+                let r = import_items(&mut d, &ctx("dev-a", 3_000), &p.items, false, None).unwrap();
                 assert_eq!(r.imported, 3);
                 assert_eq!(d.list_items().unwrap().len(), 6);
             }
@@ -142,7 +142,7 @@ macro_rules! store_tests {
                 let one = r#"{"items":[{"category":"login","title":"A","fields":[{"type":"password","label":"P","value":"x","sensitive":1}]}]}"#;
                 let mut p = enpass::parse_json(one.as_bytes()).unwrap();
                 p.items.push(p.items[0].clone());
-                let r = import_items(&mut d, &ctx("dev-a", 1_000), &p.items, true).unwrap();
+                let r = import_items(&mut d, &ctx("dev-a", 1_000), &p.items, true, None).unwrap();
                 assert_eq!((r.imported, r.skipped_duplicates), (1, 1));
             }
         }

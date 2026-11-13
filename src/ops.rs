@@ -18,7 +18,8 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::error::{Error, Result};
 use crate::models::{
-    BlockKind, Category, CategoryField, HistoryEntry, InputKind, ItemType, NoteBlock, Snapshot, Tag,
+    BlockKind, Category, CategoryField, HistoryEntry, InputKind, ItemType, NoteBlock, Snapshot,
+    Tag, VaultMeta,
 };
 
 /// Time and writer identity for a write. Injected so core stays free of wall-clock access.
@@ -163,6 +164,8 @@ pub struct NewItem {
     pub title: String,
     /// URL.
     pub url: Option<String>,
+    /// Vault to create the item in (must be live). `None` = the default vault.
+    pub vault_id: Option<String>,
     /// Category (must be live).
     pub category_id: Option<String>,
     /// Accent color.
@@ -182,6 +185,7 @@ impl NewItem {
             item_type,
             title: title.to_string(),
             url: None,
+            vault_id: None,
             category_id: None,
             color: None,
             favorite: false,
@@ -200,6 +204,8 @@ pub struct ItemUpdate {
     pub title: Option<String>,
     /// New URL.
     pub url: Option<Option<String>>,
+    /// Move the item to this vault (must be live).
+    pub vault_id: Option<String>,
     /// New category.
     pub category_id: Option<Option<String>>,
     /// New accent color.
@@ -211,6 +217,53 @@ pub struct ItemUpdate {
     /// Complete new note block set.
     pub blocks: Option<Vec<BlockInput>>,
 }
+
+/// Vault changes (`None` = unchanged; `badge: Some(None)` clears the badge).
+#[derive(Clone, Debug, Default)]
+pub struct VaultUpdate {
+    /// New name.
+    pub name: Option<String>,
+    /// New color (`#RRGGBB`).
+    pub color: Option<String>,
+    /// New badge.
+    pub badge: Option<Option<String>>,
+}
+
+const MAX_VAULT_NAME_CHARS: usize = 64;
+const MAX_VAULT_BADGE_CHARS: usize = 4;
+
+/// Trimmed, validated vault name (non-empty, ≤ 64 chars, no control characters).
+pub(crate) fn clean_vault_name(name: &str) -> Result<String> {
+    let n = name.trim();
+    if n.is_empty() || n.chars().count() > MAX_VAULT_NAME_CHARS || n.chars().any(char::is_control) {
+        return Err(Error::InvalidInput);
+    }
+    Ok(n.to_string())
+}
+
+/// Validated `#RRGGBB` color.
+pub(crate) fn check_vault_color(color: &str) -> Result<()> {
+    let ok = color.len() == 7
+        && color.starts_with('#')
+        && color.chars().skip(1).all(|c| c.is_ascii_hexdigit());
+    if ok {
+        Ok(())
+    } else {
+        Err(Error::InvalidInput)
+    }
+}
+
+/// Trimmed badge (≤ 4 chars, no control characters); empty means "no badge".
+pub(crate) fn clean_vault_badge(badge: &str) -> Result<Option<String>> {
+    let b = badge.trim();
+    if b.chars().count() > MAX_VAULT_BADGE_CHARS || b.chars().any(char::is_control) {
+        return Err(Error::InvalidInput);
+    }
+    Ok((!b.is_empty()).then(|| b.to_string()))
+}
+
+/// Upper bound of live vaults per account.
+pub(crate) const MAX_VAULTS: usize = 64;
 
 /// Category changes (`None` = unchanged).
 #[derive(Clone, Debug, Default)]
@@ -239,6 +292,8 @@ pub struct ItemSummary {
     pub title: String,
     /// URL.
     pub url: Option<String>,
+    /// Vault the item lives in.
+    pub vault_id: String,
     /// Live category, `None` if unset or the category was deleted.
     pub category_id: Option<String>,
     /// Accent color.
@@ -360,6 +415,28 @@ pub trait VaultStore {
     fn restore_item(&mut self, ctx: &WriteCtx<'_>, id: &str) -> Result<()>;
     /// Summaries of trashed items, most recently trashed first.
     fn list_trashed_items(&self) -> Result<Vec<ItemSummary>>;
+    /// Live vaults, default first (ordered by creation time, then id).
+    fn list_vaults(&self) -> Result<Vec<VaultMeta>>;
+    /// Create a vault. Names are unique (case-insensitive) among live vaults.
+    fn create_vault(
+        &mut self,
+        ctx: &WriteCtx<'_>,
+        name: &str,
+        color: &str,
+        badge: Option<&str>,
+    ) -> Result<VaultMeta>;
+    /// Rename / recolor / re-badge a live vault.
+    fn update_vault(
+        &mut self,
+        ctx: &WriteCtx<'_>,
+        id: &str,
+        upd: &VaultUpdate,
+    ) -> Result<VaultMeta>;
+    /// Delete a vault: every item in it (including trashed ones) moves to the live vault
+    /// `move_items_to`, then the vault is tombstoned. Fails if `id == move_items_to`.
+    fn delete_vault(&mut self, ctx: &WriteCtx<'_>, id: &str, move_items_to: &str) -> Result<()>;
+    /// Create the default vault if the store has never had one (never resurrects a deleted one).
+    fn ensure_default_vault(&mut self, ctx: &WriteCtx<'_>) -> Result<()>;
     /// Record one use (copy/autofill).
     fn record_use(&mut self, ctx: &WriteCtx<'_>, id: &str) -> Result<()>;
     /// Non-secret summaries of all live items outside the Trash, sorted by title.

@@ -16,21 +16,50 @@ use crate::error::{Error, Result};
 use crate::merge::merge;
 use crate::models::{
     BlockKind, Category, CategoryField, HistoryEntry, Item, ItemField, ItemTag, NoteBlock,
-    NoteImage, Snapshot, Tag,
+    NoteImage, Snapshot, Tag, VaultMeta, DEFAULT_VAULT_ID,
 };
 use crate::notes::detect_language;
 use crate::ops::{
-    bump, new_id, non_empty, plan_field_update, BlockInput, CategoryUpdate, FieldInput, FieldView,
-    ItemDetail, ItemSummary, ItemUpdate, NewCategory, NewItem, VaultStore, WriteCtx,
+    bump, check_vault_color, clean_vault_badge, clean_vault_name, new_id, non_empty,
+    plan_field_update, BlockInput, CategoryUpdate, FieldInput, FieldView, ItemDetail, ItemSummary,
+    ItemUpdate, NewCategory, NewItem, VaultStore, VaultUpdate, WriteCtx, MAX_VAULTS,
 };
 use crate::presets::seed_records;
 use crate::side_blob::sha256_hex;
 use crate::tagger::suggest_tags;
 
 /// In-memory vault store.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct MemStore {
     snap: Snapshot,
+}
+
+impl Default for MemStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Guarantee at least one live vault (a new item needs somewhere to live): create the default
+/// vault, or revive it if it is the tombstoned one.
+fn ensure_live_vault(s: &mut Snapshot) {
+    if s.vault_meta.iter().any(|v| v.deleted_at.is_none()) {
+        return;
+    }
+    if let Some(v) = s.vault_meta.iter_mut().find(|v| v.id == DEFAULT_VAULT_ID) {
+        v.deleted_at = None;
+    } else {
+        s.vault_meta.push(VaultMeta {
+            id: DEFAULT_VAULT_ID.to_string(),
+            name: "Personal".to_string(),
+            color: "#2563EB".to_string(),
+            badge: None,
+            created_at: 0,
+            updated_at: 0,
+            updated_by: String::new(),
+            deleted_at: None,
+        });
+    }
 }
 
 /// Check the foreign-key relations the SQL schema enforces, so a malformed remote cannot slip in.
@@ -85,6 +114,41 @@ fn active_item<'a>(s: &'a mut Snapshot, id: &str) -> Result<&'a mut Item> {
         return Err(Error::InvalidInput);
     }
     Ok(it)
+}
+
+/// Live vaults ordered by (creation time, id): the default vault (created at 0) comes first.
+fn live_vaults(s: &Snapshot) -> Vec<&VaultMeta> {
+    let mut v: Vec<&VaultMeta> = s
+        .vault_meta
+        .iter()
+        .filter(|v| v.deleted_at.is_none())
+        .collect();
+    v.sort_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)));
+    v
+}
+
+fn vault_is_live(s: &Snapshot, id: &str) -> bool {
+    s.vault_meta
+        .iter()
+        .any(|v| v.id == id && v.deleted_at.is_none())
+}
+
+/// Vault for a new item: the requested one (must be live) or the first live vault.
+fn resolve_vault(s: &Snapshot, requested: Option<&str>) -> Result<String> {
+    match requested {
+        Some(id) if vault_is_live(s, id) => Ok(id.to_string()),
+        Some(_) => Err(Error::NotFound),
+        None => live_vaults(s)
+            .first()
+            .map(|v| v.id.clone())
+            .ok_or(Error::NotFound),
+    }
+}
+
+fn vault_name_taken(s: &Snapshot, name: &str, except: Option<&str>) -> bool {
+    live_vaults(s)
+        .iter()
+        .any(|v| Some(v.id.as_str()) != except && v.name.to_lowercase() == name.to_lowercase())
 }
 
 fn require_live_category(s: &Snapshot, id: &str) -> Result<()> {
@@ -404,6 +468,7 @@ fn summarize(s: &Snapshot, i: &Item) -> ItemSummary {
         item_type: i.item_type,
         title: i.title.clone(),
         url: i.url.clone(),
+        vault_id: i.vault_id.clone(),
         category_id: i.category_id.clone().filter(|c| {
             s.categories
                 .iter()
@@ -420,15 +485,19 @@ fn summarize(s: &Snapshot, i: &Item) -> ItemSummary {
 }
 
 impl MemStore {
-    /// Empty store.
+    /// Empty store (with the default vault).
     pub fn new() -> Self {
-        Self::default()
+        let mut snap = Snapshot::default();
+        ensure_live_vault(&mut snap);
+        Self { snap }
     }
 
     /// Adopt a decrypted snapshot (e.g. from [`crate::vault_file::open_vault`]). Rejects
     /// snapshots whose references dangle.
     pub fn from_snapshot(snap: Snapshot) -> Result<Self> {
         check_integrity(&snap)?;
+        let mut snap = snap;
+        ensure_live_vault(&mut snap);
         Ok(Self { snap })
     }
 
@@ -476,9 +545,11 @@ impl VaultStore for MemStore {
             if let Some(c) = &new.category_id {
                 require_live_category(s, c)?;
             }
+            let vault_id = resolve_vault(s, new.vault_id.as_deref())?;
             let id = new_id(ctx)?;
             s.items.push(Item {
                 id: id.clone(),
+                vault_id,
                 category_id: new.category_id.clone(),
                 item_type: new.item_type,
                 title: new.title.clone(),
@@ -510,6 +581,10 @@ impl VaultStore for MemStore {
             if let Some(Some(c)) = &upd.category_id {
                 require_live_category(s, c)?;
             }
+            if let Some(v) = &upd.vault_id {
+                resolve_vault(s, Some(v))?;
+            }
+            let vault_id = upd.vault_id.clone().unwrap_or_else(|| cur.vault_id.clone());
             let title = upd.title.clone().unwrap_or_else(|| cur.title.clone());
             let url = upd.url.clone().unwrap_or_else(|| cur.url.clone());
             let category_id = upd
@@ -518,7 +593,8 @@ impl VaultStore for MemStore {
                 .unwrap_or_else(|| cur.category_id.clone());
             let color = upd.color.clone().unwrap_or_else(|| cur.color.clone());
             let favorite = upd.favorite.unwrap_or(cur.favorite);
-            let scalars_changed = title != cur.title
+            let scalars_changed = vault_id != cur.vault_id
+                || title != cur.title
                 || url != cur.url
                 || category_id != cur.category_id
                 || color != cur.color
@@ -533,6 +609,7 @@ impl VaultStore for MemStore {
             };
             if scalars_changed || fields_changed || blocks_changed {
                 let it = live_item(s, id)?;
+                it.vault_id = vault_id;
                 it.title = title;
                 it.url = url;
                 it.category_id = category_id;
@@ -628,6 +705,133 @@ impl VaultStore for MemStore {
             .collect();
         out.sort_by(|a, b| (b.trashed_at, &a.id).cmp(&(a.trashed_at, &b.id)));
         Ok(out)
+    }
+
+    fn list_vaults(&self) -> Result<Vec<VaultMeta>> {
+        Ok(live_vaults(&self.snap).into_iter().cloned().collect())
+    }
+
+    fn create_vault(
+        &mut self,
+        ctx: &WriteCtx<'_>,
+        name: &str,
+        color: &str,
+        badge: Option<&str>,
+    ) -> Result<VaultMeta> {
+        let name = clean_vault_name(name)?;
+        check_vault_color(color)?;
+        let badge = badge.map(clean_vault_badge).transpose()?.flatten();
+        self.tx(ctx, |s| {
+            if live_vaults(s).len() >= MAX_VAULTS || vault_name_taken(s, &name, None) {
+                return Err(Error::InvalidInput);
+            }
+            let v = VaultMeta {
+                id: new_id(ctx)?,
+                name,
+                color: color.to_string(),
+                badge,
+                created_at: ctx.now_ms,
+                updated_at: ctx.now_ms,
+                updated_by: ctx.device_id.to_string(),
+                deleted_at: None,
+            };
+            s.vault_meta.push(v.clone());
+            Ok(v)
+        })
+    }
+
+    fn update_vault(
+        &mut self,
+        ctx: &WriteCtx<'_>,
+        id: &str,
+        upd: &VaultUpdate,
+    ) -> Result<VaultMeta> {
+        let name = upd.name.as_deref().map(clean_vault_name).transpose()?;
+        if let Some(c) = &upd.color {
+            check_vault_color(c)?;
+        }
+        let badge = match &upd.badge {
+            Some(Some(b)) => Some(clean_vault_badge(b)?),
+            Some(None) => Some(None),
+            None => None,
+        };
+        self.tx(ctx, |s| {
+            if let Some(n) = &name {
+                if vault_name_taken(s, n, Some(id)) {
+                    return Err(Error::InvalidInput);
+                }
+            }
+            let v = s
+                .vault_meta
+                .iter_mut()
+                .find(|v| v.id == id && v.deleted_at.is_none())
+                .ok_or(Error::NotFound)?;
+            let changed = name.as_ref().is_some_and(|n| *n != v.name)
+                || upd.color.as_ref().is_some_and(|c| *c != v.color)
+                || badge.as_ref().is_some_and(|b| *b != v.badge);
+            if changed {
+                if let Some(n) = name {
+                    v.name = n;
+                }
+                if let Some(c) = &upd.color {
+                    v.color = c.clone();
+                }
+                if let Some(b) = badge {
+                    v.badge = b;
+                }
+                v.updated_at = bump(v.updated_at, ctx.now_ms);
+                v.updated_by = ctx.device_id.to_string();
+            }
+            Ok(v.clone())
+        })
+    }
+
+    fn delete_vault(&mut self, ctx: &WriteCtx<'_>, id: &str, move_items_to: &str) -> Result<()> {
+        if id == move_items_to {
+            return Err(Error::InvalidInput);
+        }
+        self.tx(ctx, |s| {
+            if !vault_is_live(s, id) || !vault_is_live(s, move_items_to) {
+                return Err(Error::NotFound);
+            }
+            for it in s
+                .items
+                .iter_mut()
+                .filter(|i| i.vault_id == id && i.deleted_at.is_none())
+            {
+                it.vault_id = move_items_to.to_string();
+                it.updated_at = bump(it.updated_at, ctx.now_ms);
+                it.updated_by = ctx.device_id.to_string();
+            }
+            let v = s
+                .vault_meta
+                .iter_mut()
+                .find(|v| v.id == id)
+                .ok_or(Error::NotFound)?;
+            let t = bump(v.updated_at, ctx.now_ms);
+            v.deleted_at = Some(t);
+            v.updated_at = t;
+            v.updated_by = ctx.device_id.to_string();
+            Ok(())
+        })
+    }
+
+    fn ensure_default_vault(&mut self, ctx: &WriteCtx<'_>) -> Result<()> {
+        self.tx(ctx, |s| {
+            if !s.vault_meta.iter().any(|v| v.id == DEFAULT_VAULT_ID) {
+                s.vault_meta.push(VaultMeta {
+                    id: DEFAULT_VAULT_ID.to_string(),
+                    name: "Personal".to_string(),
+                    color: "#2563EB".to_string(),
+                    badge: None,
+                    created_at: 0,
+                    updated_at: 0,
+                    updated_by: String::new(),
+                    deleted_at: None,
+                });
+            }
+            Ok(())
+        })
     }
 
     fn record_use(&mut self, ctx: &WriteCtx<'_>, id: &str) -> Result<()> {
@@ -1008,6 +1212,19 @@ impl VaultStore for MemStore {
             let (cats, fields) = seed_records(ctx, &s.categories, &s.category_fields, first);
             s.categories.extend(cats);
             upsert_category_fields(s, fields);
+            // A fresh in-memory store has no default vault yet (SQLCipher gets it from the migration).
+            if !s.vault_meta.iter().any(|v| v.id == DEFAULT_VAULT_ID) {
+                s.vault_meta.push(VaultMeta {
+                    id: DEFAULT_VAULT_ID.to_string(),
+                    name: "Personal".to_string(),
+                    color: "#2563EB".to_string(),
+                    badge: None,
+                    created_at: 0,
+                    updated_at: 0,
+                    updated_by: String::new(),
+                    deleted_at: None,
+                });
+            }
             Ok(())
         })
     }

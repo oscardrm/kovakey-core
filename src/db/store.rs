@@ -22,17 +22,20 @@ use super::{db_err, Database};
 use crate::error::{Error, Result};
 use crate::models::{
     BlockKind, Category, CategoryField, HistoryEntry, ItemType, NoteBlock, Snapshot, Tag,
+    VaultMeta, DEFAULT_VAULT_ID,
 };
 use crate::notes::detect_language;
 use crate::ops::{
-    bump, new_id, non_empty, plan_field_update, BlockInput, CategoryUpdate, FieldInput, FieldView,
-    ItemDetail, ItemSummary, ItemUpdate, NewCategory, NewItem, VaultStore, WriteCtx,
+    bump, check_vault_color, clean_vault_badge, clean_vault_name, new_id, non_empty,
+    plan_field_update, BlockInput, CategoryUpdate, FieldInput, FieldView, ItemDetail, ItemSummary,
+    ItemUpdate, NewCategory, NewItem, VaultStore, VaultUpdate, WriteCtx, MAX_VAULTS,
 };
 use crate::presets::seed_records;
 use crate::side_blob::sha256_hex;
 use crate::tagger::suggest_tags;
 
 struct ItemRow {
+    vault_id: String,
     item_type: ItemType,
     title: String,
     url: Option<String>,
@@ -65,7 +68,7 @@ fn trashed_at(conn: &Connection, id: &str) -> Result<Option<i64>> {
 
 fn live_item(conn: &Connection, id: &str) -> Result<ItemRow> {
     conn.query_row(
-        "SELECT item_type,title,url,category_id,color,favorite,updated_at
+        "SELECT item_type,title,url,category_id,color,favorite,updated_at,vault_id
          FROM items WHERE id=?1 AND deleted_at IS NULL",
         [id],
         |r| {
@@ -78,22 +81,26 @@ fn live_item(conn: &Connection, id: &str) -> Result<ItemRow> {
                 r.get::<_, Option<String>>(4)?,
                 r.get::<_, i64>(5)?,
                 r.get::<_, i64>(6)?,
+                r.get::<_, String>(7)?,
             ))
         },
     )
     .optional()
     .map_err(db_err)?
-    .map(|(ty, title, url, category_id, color, fav, updated_at)| {
-        Ok(ItemRow {
-            item_type: ItemType::parse(&ty)?,
-            title,
-            url,
-            category_id,
-            color,
-            favorite: fav != 0,
-            updated_at,
-        })
-    })
+    .map(
+        |(ty, title, url, category_id, color, fav, updated_at, vault_id)| {
+            Ok(ItemRow {
+                vault_id,
+                item_type: ItemType::parse(&ty)?,
+                title,
+                url,
+                category_id,
+                color,
+                favorite: fav != 0,
+                updated_at,
+            })
+        },
+    )
     .unwrap_or(Err(Error::NotFound))
 }
 
@@ -106,6 +113,61 @@ fn require_live_category(conn: &Connection, id: &str) -> Result<()> {
     .optional()
     .map_err(db_err)?
     .ok_or(Error::NotFound)
+}
+
+fn vault_is_live(conn: &Connection, id: &str) -> Result<bool> {
+    conn.query_row(
+        "SELECT 1 FROM vault_meta WHERE id=?1 AND deleted_at IS NULL",
+        [id],
+        |_| Ok(()),
+    )
+    .optional()
+    .map(|o| o.is_some())
+    .map_err(db_err)
+}
+
+/// Live vaults ordered by (creation time, id): the default vault (created at 0) comes first.
+fn live_vaults(conn: &Connection) -> Result<Vec<VaultMeta>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id,name,color,badge,created_at,updated_at,updated_by,deleted_at
+             FROM vault_meta WHERE deleted_at IS NULL ORDER BY created_at,id",
+        )
+        .map_err(db_err)?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(VaultMeta {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                color: r.get(2)?,
+                badge: r.get(3)?,
+                created_at: r.get(4)?,
+                updated_at: r.get(5)?,
+                updated_by: r.get(6)?,
+                deleted_at: r.get(7)?,
+            })
+        })
+        .map_err(db_err)?;
+    rows.collect::<rusqlite::Result<Vec<_>>>().map_err(db_err)
+}
+
+/// Vault for a new item: the requested one (must be live) or the first live vault.
+fn resolve_vault(conn: &Connection, requested: Option<&str>) -> Result<String> {
+    match requested {
+        Some(id) if vault_is_live(conn, id)? => Ok(id.to_string()),
+        Some(_) => Err(Error::NotFound),
+        None => live_vaults(conn)?
+            .into_iter()
+            .next()
+            .map(|v| v.id)
+            .ok_or(Error::NotFound),
+    }
+}
+
+fn vault_name_taken(conn: &Connection, name: &str, except: Option<&str>) -> Result<bool> {
+    Ok(live_vaults(conn)?
+        .iter()
+        .any(|v| Some(v.id.as_str()) != except && v.name.to_lowercase() == name.to_lowercase()))
 }
 
 fn require_image(conn: &Connection, id: &str) -> Result<()> {
@@ -504,7 +566,7 @@ fn summaries(conn: &Connection, only: Option<&str>) -> Result<Vec<ItemSummary>> 
         .prepare(
             "SELECT i.id,i.item_type,i.title,i.url,
                     CASE WHEN c.deleted_at IS NULL THEN i.category_id END,
-                    i.color,i.favorite,i.use_count,i.last_used_at,i.updated_at,i.trashed_at
+                    i.color,i.favorite,i.use_count,i.last_used_at,i.updated_at,i.trashed_at,i.vault_id
              FROM items i LEFT JOIN categories c ON c.id=i.category_id
              WHERE i.deleted_at IS NULL AND (?1 IS NULL OR i.id=?1)
              ORDER BY i.title COLLATE NOCASE,i.id",
@@ -524,6 +586,7 @@ fn summaries(conn: &Connection, only: Option<&str>) -> Result<Vec<ItemSummary>> 
                 r.get::<_, Option<i64>>(8)?,
                 r.get::<_, i64>(9)?,
                 r.get::<_, Option<i64>>(10)?,
+                r.get::<_, String>(11)?,
             ))
         })
         .map_err(db_err)?;
@@ -541,8 +604,10 @@ fn summaries(conn: &Connection, only: Option<&str>) -> Result<Vec<ItemSummary>> 
             last_used_at,
             updated_at,
             trashed_at,
+            vault_id,
         ) = row.map_err(db_err)?;
         out.push(ItemSummary {
+            vault_id,
             item_type: ItemType::parse(&ty)?,
             tags: tags.remove(&id).unwrap_or_default(),
             id,
@@ -584,10 +649,11 @@ impl Database {
         if let Some(c) = &new.category_id {
             require_live_category(&tx, c)?;
         }
+        let vault_id = resolve_vault(&tx, new.vault_id.as_deref())?;
         let id = new_id(ctx)?;
         tx.execute(
-            "INSERT INTO items(id,category_id,item_type,title,url,color,favorite,created_at,updated_at,updated_by)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?8,?9)",
+            "INSERT INTO items(id,category_id,item_type,title,url,color,favorite,created_at,updated_at,updated_by,vault_id)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?8,?9,?10)",
             params![
                 id,
                 new.category_id,
@@ -597,7 +663,8 @@ impl Database {
                 new.color,
                 i64::from(new.favorite),
                 ctx.now_ms,
-                ctx.device_id
+                ctx.device_id,
+                vault_id
             ],
         )
         .map_err(db_err)?;
@@ -620,6 +687,10 @@ impl Database {
         if let Some(Some(c)) = &upd.category_id {
             require_live_category(&tx, c)?;
         }
+        if let Some(v) = &upd.vault_id {
+            resolve_vault(&tx, Some(v))?;
+        }
+        let vault_id = upd.vault_id.clone().unwrap_or_else(|| cur.vault_id.clone());
         let title = upd.title.clone().unwrap_or_else(|| cur.title.clone());
         let url = upd.url.clone().unwrap_or_else(|| cur.url.clone());
         let category_id = upd
@@ -628,7 +699,8 @@ impl Database {
             .unwrap_or_else(|| cur.category_id.clone());
         let color = upd.color.clone().unwrap_or_else(|| cur.color.clone());
         let favorite = upd.favorite.unwrap_or(cur.favorite);
-        let scalars_changed = title != cur.title
+        let scalars_changed = vault_id != cur.vault_id
+            || title != cur.title
             || url != cur.url
             || category_id != cur.category_id
             || color != cur.color
@@ -644,7 +716,7 @@ impl Database {
         if scalars_changed || fields_changed || blocks_changed {
             tx.execute(
                 "UPDATE items SET title=?2,url=?3,category_id=?4,color=?5,favorite=?6,
-                        updated_at=?7,updated_by=?8 WHERE id=?1",
+                        updated_at=?7,updated_by=?8,vault_id=?9 WHERE id=?1",
                 params![
                     id,
                     title,
@@ -653,7 +725,8 @@ impl Database {
                     color,
                     i64::from(favorite),
                     bump(cur.updated_at, ctx.now_ms),
-                    ctx.device_id
+                    ctx.device_id,
+                    vault_id
                 ],
             )
             .map_err(db_err)?;
@@ -735,6 +808,141 @@ impl Database {
             .collect();
         out.sort_by(|a, b| (b.trashed_at, &a.id).cmp(&(a.trashed_at, &b.id)));
         Ok(out)
+    }
+
+    // ---- vaults ------------------------------------------------------------------------
+
+    /// Live vaults, default first.
+    pub fn list_vaults(&self) -> Result<Vec<VaultMeta>> {
+        live_vaults(self.conn())
+    }
+
+    /// Create a vault; names are unique (case-insensitive) among live vaults.
+    pub fn create_vault(
+        &mut self,
+        ctx: &WriteCtx<'_>,
+        name: &str,
+        color: &str,
+        badge: Option<&str>,
+    ) -> Result<VaultMeta> {
+        let name = clean_vault_name(name)?;
+        check_vault_color(color)?;
+        let badge = badge.map(clean_vault_badge).transpose()?.flatten();
+        let tx = self.begin(ctx)?;
+        if live_vaults(&tx)?.len() >= MAX_VAULTS || vault_name_taken(&tx, &name, None)? {
+            return Err(Error::InvalidInput);
+        }
+        let v = VaultMeta {
+            id: new_id(ctx)?,
+            name,
+            color: color.to_string(),
+            badge,
+            created_at: ctx.now_ms,
+            updated_at: ctx.now_ms,
+            updated_by: ctx.device_id.to_string(),
+            deleted_at: None,
+        };
+        tx.execute(
+            "INSERT INTO vault_meta(id,name,color,badge,created_at,updated_at,updated_by)
+             VALUES(?1,?2,?3,?4,?5,?5,?6)",
+            params![v.id, v.name, v.color, v.badge, v.created_at, v.updated_by],
+        )
+        .map_err(db_err)?;
+        tx.commit().map_err(db_err)?;
+        Ok(v)
+    }
+
+    /// Rename / recolor / re-badge a live vault. Writes nothing if no value changes.
+    pub fn update_vault(
+        &mut self,
+        ctx: &WriteCtx<'_>,
+        id: &str,
+        upd: &VaultUpdate,
+    ) -> Result<VaultMeta> {
+        let name = upd.name.as_deref().map(clean_vault_name).transpose()?;
+        if let Some(c) = &upd.color {
+            check_vault_color(c)?;
+        }
+        let badge = match &upd.badge {
+            Some(Some(b)) => Some(clean_vault_badge(b)?),
+            Some(None) => Some(None),
+            None => None,
+        };
+        let tx = self.begin(ctx)?;
+        let mut cur = live_vaults(&tx)?
+            .into_iter()
+            .find(|v| v.id == id)
+            .ok_or(Error::NotFound)?;
+        if let Some(n) = &name {
+            if vault_name_taken(&tx, n, Some(id))? {
+                return Err(Error::InvalidInput);
+            }
+        }
+        let changed = name.as_ref().is_some_and(|n| *n != cur.name)
+            || upd.color.as_ref().is_some_and(|c| *c != cur.color)
+            || badge.as_ref().is_some_and(|b| *b != cur.badge);
+        if changed {
+            if let Some(n) = name {
+                cur.name = n;
+            }
+            if let Some(c) = &upd.color {
+                cur.color = c.clone();
+            }
+            if let Some(b) = badge {
+                cur.badge = b;
+            }
+            cur.updated_at = bump(cur.updated_at, ctx.now_ms);
+            cur.updated_by = ctx.device_id.to_string();
+            tx.execute(
+                "UPDATE vault_meta SET name=?2,color=?3,badge=?4,updated_at=?5,updated_by=?6 WHERE id=?1",
+                params![id, cur.name, cur.color, cur.badge, cur.updated_at, cur.updated_by],
+            )
+            .map_err(db_err)?;
+        }
+        tx.commit().map_err(db_err)?;
+        Ok(cur)
+    }
+
+    /// Delete a vault: its items (trashed ones included) move to `move_items_to`, then the vault
+    /// is tombstoned.
+    pub fn delete_vault(
+        &mut self,
+        ctx: &WriteCtx<'_>,
+        id: &str,
+        move_items_to: &str,
+    ) -> Result<()> {
+        if id == move_items_to {
+            return Err(Error::InvalidInput);
+        }
+        let tx = self.begin(ctx)?;
+        if !vault_is_live(&tx, id)? || !vault_is_live(&tx, move_items_to)? {
+            return Err(Error::NotFound);
+        }
+        tx.execute(
+            "UPDATE items SET vault_id=?2,updated_at=max(?3,updated_at+1),updated_by=?4
+             WHERE vault_id=?1 AND deleted_at IS NULL",
+            params![id, move_items_to, ctx.now_ms, ctx.device_id],
+        )
+        .map_err(db_err)?;
+        tx.execute(
+            "UPDATE vault_meta SET deleted_at=max(?2,updated_at+1),updated_at=max(?2,updated_at+1),updated_by=?3
+             WHERE id=?1",
+            params![id, ctx.now_ms, ctx.device_id],
+        )
+        .map_err(db_err)?;
+        tx.commit().map_err(db_err)
+    }
+
+    /// Create the default vault if the store has never had one.
+    pub fn ensure_default_vault(&mut self, ctx: &WriteCtx<'_>) -> Result<()> {
+        let tx = self.begin(ctx)?;
+        tx.execute(
+            "INSERT OR IGNORE INTO vault_meta(id,name,color,badge,created_at,updated_at,updated_by)
+             VALUES(?1,'Personal','#2563EB',NULL,0,0,'')",
+            [DEFAULT_VAULT_ID],
+        )
+        .map_err(db_err)?;
+        tx.commit().map_err(db_err)
     }
 
     /// Record one use (copy/autofill). Monotone counters; does not touch `updated_at`, so a
@@ -1309,6 +1517,11 @@ impl VaultStore for Database {
         fn trash_item(&mut Self, ctx: &WriteCtx<'_>, id: &str) -> Result<()>;
         fn restore_item(&mut Self, ctx: &WriteCtx<'_>, id: &str) -> Result<()>;
         fn list_trashed_items(&Self) -> Result<Vec<ItemSummary>>;
+        fn list_vaults(&Self) -> Result<Vec<VaultMeta>>;
+        fn create_vault(&mut Self, ctx: &WriteCtx<'_>, name: &str, color: &str, badge: Option<&str>) -> Result<VaultMeta>;
+        fn update_vault(&mut Self, ctx: &WriteCtx<'_>, id: &str, upd: &VaultUpdate) -> Result<VaultMeta>;
+        fn delete_vault(&mut Self, ctx: &WriteCtx<'_>, id: &str, move_items_to: &str) -> Result<()>;
+        fn ensure_default_vault(&mut Self, ctx: &WriteCtx<'_>) -> Result<()>;
         fn record_use(&mut Self, ctx: &WriteCtx<'_>, id: &str) -> Result<()>;
         fn list_items(&Self) -> Result<Vec<ItemSummary>>;
         fn get_item(&Self, id: &str) -> Result<ItemDetail>;

@@ -98,6 +98,9 @@ impl ItemType {
 pub struct Item {
     /// Item id (UUIDv7).
     pub id: String,
+    /// Vault (section of the account) the item lives in; see [`VaultMeta`]. Merges with the item
+    /// (last-writer-wins), so moving an item between vaults is an ordinary edit.
+    pub vault_id: String,
     /// Owning category.
     pub category_id: Option<String>,
     /// Item type.
@@ -500,7 +503,12 @@ impl Drop for NoteImage {
     }
 }
 
-/// Vault metadata (name, color, badge).
+/// Id of the vault every account starts with (and that pre-vault data belongs to). Fixed so that
+/// devices migrating independently create the *same* record instead of duplicates.
+pub const DEFAULT_VAULT_ID: &str = "default";
+
+/// A vault: a named section of the account (Personal, Work, ...). All vaults of an account share
+/// one password and one data key; items belong to exactly one vault.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct VaultMeta {
     /// Vault id.
@@ -517,6 +525,8 @@ pub struct VaultMeta {
     pub updated_at: i64,
     /// Device id of the last writer.
     pub updated_by: String,
+    /// Tombstone time of a deleted vault (its items were moved to another vault first).
+    pub deleted_at: Option<i64>,
 }
 
 /// Everything that is merged between two copies of one vault.

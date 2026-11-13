@@ -27,6 +27,8 @@ pub struct ItemFilter {
     pub query: String,
     /// Only this item type.
     pub item_type: Option<ItemType>,
+    /// Only this vault (`None` = every vault).
+    pub vault_id: Option<String>,
     /// Only this category.
     pub category_id: Option<String>,
     /// Only items carrying this tag name.
@@ -40,6 +42,7 @@ pub struct ItemFilter {
 fn matches(item: &ItemSummary, terms: &[String], f: &ItemFilter) -> bool {
     if f.item_type.is_some_and(|t| t != item.item_type)
         || f.favorites_only && !item.favorite
+        || f.vault_id.as_deref().is_some_and(|v| item.vault_id != v)
         || f.category_id
             .as_deref()
             .is_some_and(|c| item.category_id.as_deref() != Some(c))
@@ -142,6 +145,7 @@ mod tests {
     fn item(id: &str, title: &str, ty: ItemType) -> ItemSummary {
         ItemSummary {
             id: id.into(),
+            vault_id: "default".into(),
             item_type: ty,
             title: title.into(),
             url: None,
