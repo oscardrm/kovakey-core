@@ -509,6 +509,95 @@ pub trait VaultStore {
     fn rename_attachment(&mut self, ctx: &WriteCtx<'_>, id: &str, file_name: &str) -> Result<()>;
     /// Tombstone an attachment and scrub its bytes.
     fn delete_attachment(&mut self, ctx: &WriteCtx<'_>, id: &str) -> Result<()>;
+    /// Store a passkey on a live, non-trashed item; returns its record id. A live passkey of the same
+    /// relying party and user handle is replaced (tombstoned, key scrubbed) in the same transaction,
+    /// as WebAuthn requires. Inputs must already be validated (see [`VaultStore::register_passkey`]).
+    fn add_passkey(
+        &mut self,
+        ctx: &WriteCtx<'_>,
+        item_id: &str,
+        new: &NewPasskey,
+    ) -> Result<String>;
+    /// Live passkeys of an item (metadata only), oldest first.
+    fn list_passkeys(&self, item_id: &str) -> Result<Vec<PasskeyInfo>>;
+    /// Live passkeys for a relying party on items that are not trashed (metadata only), newest
+    /// first. `rp_id` is normalized first; an invalid one yields an empty list.
+    fn passkeys_for_rp(&self, rp_id: &str) -> Result<Vec<PasskeyInfo>>;
+    /// Metadata and private key of a live passkey on a non-trashed item. **Core-internal**: never
+    /// expose it through FFI/wasm; bindings call [`VaultStore::assert_passkey`] instead.
+    fn passkey_secret(&self, id: &str) -> Result<(PasskeyInfo, Zeroizing<Vec<u8>>)>;
+    /// Tombstone a passkey and scrub its key.
+    fn delete_passkey(&mut self, ctx: &WriteCtx<'_>, id: &str) -> Result<()>;
+
+    /// Create a passkey (ADR 0020): validates the untrusted inputs, generates an ES256 key, stores it
+    /// on `item_id` (or on a new Credential item for the site when `None`) and returns the
+    /// registration response. The private key never leaves the core.
+    fn register_passkey(
+        &mut self,
+        ctx: &WriteCtx<'_>,
+        item_id: Option<&str>,
+        rp_id: &str,
+        user_name: &str,
+        user_handle: &[u8],
+        client_data_hash: &[u8],
+    ) -> Result<PasskeyRegistration> {
+        let rp_id = crate::passkey::normalize_rp_id(rp_id)?;
+        let user_name = crate::passkey::clean_user_name(user_name);
+        crate::passkey::check_user_handle(user_handle)?;
+        crate::passkey::check_client_data_hash(client_data_hash)?;
+        let private_key = crate::passkey::generate_private_key()?;
+        let credential_id = crate::passkey::new_credential_id()?;
+        let cose = crate::passkey::cose_public_key(&private_key)?;
+        let auth_data = crate::passkey::authenticator_data(
+            &rp_id,
+            crate::passkey::REGISTRATION_FLAGS,
+            Some((&credential_id, &cose)),
+        )?;
+        let attestation_object = crate::passkey::attestation_object(&auth_data)?;
+        // Validation and key generation are done; only storage can fail from here on.
+        let item_id = match item_id {
+            Some(id) => id.to_string(),
+            None => {
+                let mut item = NewItem::new(ItemType::Credential, &rp_id);
+                item.url = Some(format!("https://{rp_id}"));
+                if !user_name.is_empty() {
+                    item.fields = vec![FieldInput::new("Username", "text", &user_name, false)];
+                }
+                self.create_item(ctx, &item)?
+            }
+        };
+        let new = NewPasskey {
+            credential_id: credential_id.clone(),
+            rp_id,
+            user_name,
+            user_handle: user_handle.to_vec(),
+            private_key,
+        };
+        let passkey_id = self.add_passkey(ctx, &item_id, &new)?;
+        Ok(PasskeyRegistration {
+            passkey_id,
+            item_id,
+            credential_id,
+            authenticator_data: auth_data,
+            attestation_object,
+        })
+    }
+
+    /// Sign a WebAuthn assertion with a stored passkey (ADR 0020). Read-only: the sign count stays 0.
+    fn assert_passkey(&self, id: &str, client_data_hash: &[u8]) -> Result<PasskeyAssertion> {
+        crate::passkey::check_client_data_hash(client_data_hash)?;
+        let (info, key) = self.passkey_secret(id)?;
+        let auth_data =
+            crate::passkey::authenticator_data(&info.rp_id, crate::passkey::ASSERTION_FLAGS, None)?;
+        let signature = crate::passkey::sign_assertion(&key, &auth_data, client_data_hash)?;
+        Ok(PasskeyAssertion {
+            rp_id: info.rp_id.clone(),
+            credential_id: info.credential_id.clone(),
+            user_handle: info.user_handle.clone(),
+            authenticator_data: auth_data,
+            signature,
+        })
+    }
     /// The whole vault as a merge snapshot.
     fn snapshot(&self) -> Result<Snapshot>;
     /// Merge a decrypted remote snapshot atomically.
@@ -532,6 +621,102 @@ pub struct AttachmentInfo {
     pub created_at: i64,
     /// Last modification time, Unix ms UTC.
     pub updated_at: i64,
+}
+
+/// A validated passkey to store (built by [`VaultStore::register_passkey`]).
+pub struct NewPasskey {
+    /// WebAuthn credential id.
+    pub credential_id: Vec<u8>,
+    /// Normalized relying-party id.
+    pub rp_id: String,
+    /// Cleaned user name.
+    pub user_name: String,
+    /// User handle (1–64 bytes).
+    pub user_handle: Vec<u8>,
+    /// P-256 private scalar.
+    pub private_key: Zeroizing<Vec<u8>>,
+}
+
+impl fmt::Debug for NewPasskey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("NewPasskey(<redacted>)")
+    }
+}
+
+/// Non-secret view of a passkey (ADR 0020). `rp_id`, `user_name` and `user_handle` are untrusted
+/// site data; show them as plain text only.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PasskeyInfo {
+    /// Record id.
+    pub id: String,
+    /// Owning item.
+    pub item_id: String,
+    /// WebAuthn credential id.
+    pub credential_id: Vec<u8>,
+    /// Relying-party id.
+    pub rp_id: String,
+    /// Account name.
+    pub user_name: String,
+    /// User handle.
+    pub user_handle: Vec<u8>,
+    /// Creation time, Unix ms UTC.
+    pub created_at: i64,
+    /// Last modification time, Unix ms UTC.
+    pub updated_at: i64,
+}
+
+impl fmt::Debug for PasskeyInfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PasskeyInfo")
+            .field("id", &self.id)
+            .field("item_id", &self.item_id)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Registration response handed to the platform.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PasskeyRegistration {
+    /// Stored record id.
+    pub passkey_id: String,
+    /// Item that holds the passkey (new when none was given).
+    pub item_id: String,
+    /// WebAuthn credential id.
+    pub credential_id: Vec<u8>,
+    /// Authenticator data (with attested credential data).
+    pub authenticator_data: Vec<u8>,
+    /// CBOR attestation object (`fmt: "none"`).
+    pub attestation_object: Vec<u8>,
+}
+
+impl fmt::Debug for PasskeyRegistration {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PasskeyRegistration")
+            .field("passkey_id", &self.passkey_id)
+            .field("item_id", &self.item_id)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Assertion response handed to the platform.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PasskeyAssertion {
+    /// Relying-party id.
+    pub rp_id: String,
+    /// WebAuthn credential id.
+    pub credential_id: Vec<u8>,
+    /// User handle.
+    pub user_handle: Vec<u8>,
+    /// Authenticator data (no attested data).
+    pub authenticator_data: Vec<u8>,
+    /// DER ECDSA signature over `authenticator_data ‖ client_data_hash`.
+    pub signature: Vec<u8>,
+}
+
+impl fmt::Debug for PasskeyAssertion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("PasskeyAssertion(<redacted>)")
+    }
 }
 
 /// Longest stored file name, in bytes.

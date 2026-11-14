@@ -19,7 +19,7 @@ use crate::error::{Error, Result};
 use crate::merge::merge;
 use crate::models::{
     Attachment, BlockKind, Category, CategoryField, HistoryEntry, Item, ItemField, ItemTag,
-    ItemType, NoteBlock, NoteImage, Snapshot, Tag, VaultMeta,
+    ItemType, NoteBlock, NoteImage, Passkey, Snapshot, Tag, VaultMeta,
 };
 
 fn corrupt(idx: usize, e: Error) -> rusqlite::Error {
@@ -250,6 +250,26 @@ fn read_all(conn: &Connection) -> Result<Snapshot> {
             })
         },
     )?;
+    let passkeys = query(
+        conn,
+        "SELECT id,item_id,credential_id,rp_id,user_name,user_handle,private_key,created_at,updated_at,updated_by,deleted_at
+         FROM passkeys ORDER BY id",
+        |r| {
+            Ok(Passkey {
+                id: r.get(0)?,
+                item_id: r.get(1)?,
+                credential_id: r.get(2)?,
+                rp_id: r.get(3)?,
+                user_name: r.get(4)?,
+                user_handle: r.get(5)?,
+                private_key: r.get(6)?,
+                created_at: r.get(7)?,
+                updated_at: r.get(8)?,
+                updated_by: r.get(9)?,
+                deleted_at: r.get(10)?,
+            })
+        },
+    )?;
     Ok(Snapshot {
         vault_meta,
         categories,
@@ -261,6 +281,7 @@ fn read_all(conn: &Connection) -> Result<Snapshot> {
         note_blocks,
         note_images,
         attachments,
+        passkeys,
     })
 }
 
@@ -462,6 +483,31 @@ fn write_all(conn: &Connection, snap: &Snapshot) -> Result<()> {
                 a.updated_at,
                 a.updated_by,
                 a.deleted_at
+            ],
+        )
+        .map_err(db_err)?;
+    }
+    for p in &snap.passkeys {
+        conn.execute(
+            "INSERT INTO passkeys(id,item_id,credential_id,rp_id,user_name,user_handle,private_key,created_at,updated_at,updated_by,deleted_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
+             ON CONFLICT(id) DO UPDATE SET item_id=excluded.item_id,credential_id=excluded.credential_id,
+               rp_id=excluded.rp_id,user_name=excluded.user_name,user_handle=excluded.user_handle,
+               private_key=excluded.private_key,updated_at=excluded.updated_at,
+               updated_by=excluded.updated_by,deleted_at=excluded.deleted_at
+             WHERE (excluded.updated_at,excluded.updated_by) >= (passkeys.updated_at,passkeys.updated_by)",
+            params![
+                p.id,
+                p.item_id,
+                p.credential_id,
+                p.rp_id,
+                p.user_name,
+                p.user_handle,
+                p.private_key,
+                p.created_at,
+                p.updated_at,
+                p.updated_by,
+                p.deleted_at
             ],
         )
         .map_err(db_err)?;

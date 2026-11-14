@@ -558,6 +558,58 @@ impl Drop for Attachment {
     }
 }
 
+/// A WebAuthn passkey of an item (ADR 0020). ES256 only. `rp_id`, `user_name` and `user_handle`
+/// come from websites (untrusted). `private_key` is the 32-byte P-256 scalar, blank once
+/// tombstoned; it never leaves the core. Metadata merges last-writer-wins; the key is immutable.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Passkey {
+    /// Record id.
+    pub id: String,
+    /// Owning item.
+    pub item_id: String,
+    /// WebAuthn credential id (random bytes chosen by KovaKey).
+    pub credential_id: Vec<u8>,
+    /// Relying-party id (normalized DNS name).
+    pub rp_id: String,
+    /// Account name shown by the site.
+    pub user_name: String,
+    /// Opaque user handle chosen by the site.
+    pub user_handle: Vec<u8>,
+    /// P-256 private scalar. Blank once tombstoned.
+    pub private_key: Vec<u8>,
+    /// Creation time, Unix ms UTC.
+    pub created_at: i64,
+    /// Last modification time, Unix ms UTC.
+    pub updated_at: i64,
+    /// Device id of the last writer.
+    pub updated_by: String,
+    /// Tombstone time.
+    pub deleted_at: Option<i64>,
+}
+
+impl fmt::Debug for Passkey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Account metadata and the key are never printed.
+        f.debug_struct("Passkey")
+            .field("id", &self.id)
+            .field("item_id", &self.item_id)
+            .field("rp_id", &REDACTED)
+            .field("user_name", &REDACTED)
+            .field("private_key", &REDACTED)
+            .field("updated_at", &self.updated_at)
+            .field("deleted_at", &self.deleted_at)
+            .finish()
+    }
+}
+
+impl Drop for Passkey {
+    fn drop(&mut self) {
+        self.private_key.zeroize();
+        self.user_handle.zeroize();
+        self.user_name.zeroize();
+    }
+}
+
 /// Id of the vault every account starts with (and that pre-vault data belongs to). Fixed so that
 /// devices migrating independently create the *same* record instead of duplicates.
 pub const DEFAULT_VAULT_ID: &str = "default";
@@ -607,4 +659,6 @@ pub struct Snapshot {
     pub note_images: Vec<NoteImage>,
     /// File attachments (ADR 0019).
     pub attachments: Vec<Attachment>,
+    /// Passkeys (ADR 0020).
+    pub passkeys: Vec<Passkey>,
 }

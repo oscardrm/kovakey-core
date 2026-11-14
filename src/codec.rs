@@ -7,7 +7,10 @@ use crate::models::Snapshot;
 use crate::side_blob::{is_external, sha256_hex};
 
 /// Newest snapshot payload format version this build can read and write.
-pub const SNAPSHOT_FORMAT_VERSION: u8 = 5;
+pub const SNAPSHOT_FORMAT_VERSION: u8 = 6;
+
+/// Version written when the snapshot has attachments but no passkeys (ADR 0019).
+const ATTACHMENTS_FORMAT_VERSION: u8 = 5;
 
 /// Version written when the snapshot has no attachments. Staying on v4 keeps such vaults readable
 /// by builds that predate attachments (ADR 0019).
@@ -35,19 +38,22 @@ pub struct ExternalBlob<'a> {
 /// Resolver for externalized image bytes: `(sha256_hex, size) -> bytes`.
 pub type ImageResolver<'a> = dyn FnMut(&str, u64) -> Result<Zeroizing<Vec<u8>>> + 'a;
 
-/// Serialize `snapshot` at v5 if it has attachments, else v4 (v2 = the frozen v1 payload followed by
+/// Serialize `snapshot` at v6 if it has passkeys, v5 if it has attachments, else v4 (v2 = the frozen v1 payload followed by
 /// the category extension: preset keys and category field templates; v3 appends the Trash
 /// extension: the trash time of each trashed item; v4 appends the Vaults extension: each item's
-/// vault and the tombstone time of deleted vaults).
+/// vault and the tombstone time of deleted vaults; v5 appends attachments; v6 appends passkeys).
+/// Writing the lowest version that holds the data keeps vaults readable by older builds.
 ///
 /// Image `sha256`/`size` are verified against the bytes (ADR 0001: never trusted on save);
 /// a mismatch is [`Error::InvalidInput`]. Images above the side-blob threshold are replaced by a
 /// reference and returned in [`EncodedSnapshot::external`].
 pub fn encode_snapshot(snapshot: &Snapshot) -> Result<EncodedSnapshot<'_>> {
-    let version = if snapshot.attachments.is_empty() {
-        BASE_FORMAT_VERSION
-    } else {
+    let version = if !snapshot.passkeys.is_empty() {
         SNAPSHOT_FORMAT_VERSION
+    } else if !snapshot.attachments.is_empty() {
+        ATTACHMENTS_FORMAT_VERSION
+    } else {
+        BASE_FORMAT_VERSION
     };
     encode_at(snapshot, version)
 }
@@ -76,6 +82,11 @@ fn encode_at(snapshot: &Snapshot, version: u8) -> Result<EncodedSnapshot<'_>> {
         bytes.extend_from_slice(&tail);
         external.extend(blobs);
     }
+    if version >= 6 {
+        let ext = v6::Ext::from_snapshot(snapshot)?;
+        let tail = postcard::to_allocvec(&ext).map_err(|_| Error::Corrupted)?;
+        bytes.extend_from_slice(&tail);
+    }
     Ok(EncodedSnapshot {
         version,
         payload: Zeroizing::new(bytes),
@@ -95,7 +106,7 @@ pub fn decode_snapshot(
 ) -> Result<Snapshot> {
     match version {
         1 => v1::decode(bytes, resolve),
-        2..=5 => {
+        2..=6 => {
             let (mut snap, rest) = v1::decode_prefix(bytes, resolve)?;
             let (ext, rest) =
                 postcard::take_from_bytes::<v2::Ext>(rest).map_err(|_| Error::Corrupted)?;
@@ -124,6 +135,14 @@ pub fn decode_snapshot(
             } else {
                 rest
             };
+            let rest = if version >= 6 {
+                let (keys, rest) =
+                    postcard::take_from_bytes::<v6::Ext>(rest).map_err(|_| Error::Corrupted)?;
+                keys.apply(&mut snap)?;
+                rest
+            } else {
+                rest
+            };
             if !rest.is_empty() {
                 return Err(Error::Corrupted);
             }
@@ -139,7 +158,7 @@ pub fn external_image_refs(version: u8, bytes: &[u8]) -> Result<Vec<(String, u64
     match version {
         1 => v1::external_refs(bytes),
         2..=4 => v1::external_refs_prefix(bytes),
-        5 => {
+        5 | 6 => {
             let (mut refs, rest) = v1::external_refs_split(bytes)?;
             let (_, rest) =
                 postcard::take_from_bytes::<v2::Ext>(rest).map_err(|_| Error::Corrupted)?;
@@ -149,6 +168,14 @@ pub fn external_image_refs(version: u8, bytes: &[u8]) -> Result<Vec<(String, u64
                 postcard::take_from_bytes::<v4::Ext>(rest).map_err(|_| Error::Corrupted)?;
             let (att, rest) =
                 postcard::take_from_bytes::<v5::Ext>(rest).map_err(|_| Error::Corrupted)?;
+            // Passkeys (v6) are small and always inline: no side blobs to fetch.
+            let rest = if version == 6 {
+                postcard::take_from_bytes::<v6::Ext>(rest)
+                    .map_err(|_| Error::Corrupted)?
+                    .1
+            } else {
+                rest
+            };
             if !rest.is_empty() {
                 return Err(Error::Corrupted);
             }
@@ -161,7 +188,7 @@ pub fn external_image_refs(version: u8, bytes: &[u8]) -> Result<Vec<(String, u64
 
 /// Whether this build can decode `version`.
 pub fn is_supported_version(version: u8) -> bool {
-    matches!(version, 1..=5)
+    matches!(version, 1..=6)
 }
 
 /// Wire format v1. **Frozen**: postcard is not self-describing, so any change to these types
@@ -913,6 +940,122 @@ mod v5 {
     }
 }
 
+/// Wire format v6 extension (appended after v5): passkeys (ADR 0020). Keys are 32 bytes and travel
+/// inline inside the encrypted payload. Live passkeys must carry a valid P-256 scalar; tombstones
+/// must carry none. Written only when the vault has passkey rows.
+mod v6 {
+    use serde::{Deserialize, Serialize};
+    use zeroize::Zeroize;
+
+    use crate::error::{Error, Result};
+    use crate::models::{Passkey, Snapshot};
+    use crate::passkey::{
+        check_user_handle, cose_public_key, normalize_rp_id, CREDENTIAL_ID_LEN, PRIVATE_KEY_LEN,
+    };
+
+    #[derive(Serialize, Deserialize, Zeroize)]
+    #[zeroize(drop)]
+    pub(super) struct PasskeyW {
+        id: String,
+        item_id: String,
+        credential_id: Vec<u8>,
+        rp_id: String,
+        user_name: String,
+        user_handle: Vec<u8>,
+        private_key: Vec<u8>,
+        created_at: i64,
+        updated_at: i64,
+        updated_by: String,
+        deleted_at: Option<i64>,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    pub struct Ext {
+        passkeys: Vec<PasskeyW>,
+    }
+
+    /// Shape checks shared by encode (`InvalidInput`) and decode (`Corrupted`).
+    fn well_formed(
+        credential_id: &[u8],
+        rp_id: &str,
+        user_handle: &[u8],
+        key: &[u8],
+        deleted: bool,
+    ) -> bool {
+        let shape = !credential_id.is_empty()
+            && credential_id.len() <= 4 * CREDENTIAL_ID_LEN
+            && normalize_rp_id(rp_id).is_ok_and(|n| n == rp_id)
+            && check_user_handle(user_handle).is_ok();
+        let key_ok = if deleted {
+            key.is_empty()
+        } else {
+            key.len() == PRIVATE_KEY_LEN && cose_public_key(key).is_ok()
+        };
+        shape && key_ok
+    }
+
+    impl Ext {
+        pub fn from_snapshot(s: &Snapshot) -> Result<Self> {
+            let mut passkeys = Vec::with_capacity(s.passkeys.len());
+            for p in &s.passkeys {
+                if !well_formed(
+                    &p.credential_id,
+                    &p.rp_id,
+                    &p.user_handle,
+                    &p.private_key,
+                    p.deleted_at.is_some(),
+                ) {
+                    return Err(Error::InvalidInput);
+                }
+                passkeys.push(PasskeyW {
+                    id: p.id.clone(),
+                    item_id: p.item_id.clone(),
+                    credential_id: p.credential_id.clone(),
+                    rp_id: p.rp_id.clone(),
+                    user_name: p.user_name.clone(),
+                    user_handle: p.user_handle.clone(),
+                    private_key: p.private_key.clone(),
+                    created_at: p.created_at,
+                    updated_at: p.updated_at,
+                    updated_by: p.updated_by.clone(),
+                    deleted_at: p.deleted_at,
+                });
+            }
+            Ok(Self { passkeys })
+        }
+
+        pub fn apply(mut self, snap: &mut Snapshot) -> Result<()> {
+            for w in &mut self.passkeys {
+                if !snap.items.iter().any(|i| i.id == w.item_id)
+                    || !well_formed(
+                        &w.credential_id,
+                        &w.rp_id,
+                        &w.user_handle,
+                        &w.private_key,
+                        w.deleted_at.is_some(),
+                    )
+                {
+                    return Err(Error::Corrupted);
+                }
+                snap.passkeys.push(Passkey {
+                    id: std::mem::take(&mut w.id),
+                    item_id: std::mem::take(&mut w.item_id),
+                    credential_id: std::mem::take(&mut w.credential_id),
+                    rp_id: std::mem::take(&mut w.rp_id),
+                    user_name: std::mem::take(&mut w.user_name),
+                    user_handle: std::mem::take(&mut w.user_handle),
+                    private_key: std::mem::take(&mut w.private_key),
+                    created_at: w.created_at,
+                    updated_at: w.updated_at,
+                    updated_by: std::mem::take(&mut w.updated_by),
+                    deleted_at: w.deleted_at,
+                });
+            }
+            Ok(())
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod fixtures {
     use std::collections::BTreeSet;
@@ -1095,6 +1238,7 @@ pub(crate) mod fixtures {
             }],
             note_images: images,
             attachments: Vec::new(),
+            passkeys: Vec::new(),
         }
     }
 }
@@ -1294,7 +1438,7 @@ mod tests {
     fn unknown_versions_are_rejected_before_parsing() {
         let snap = sample(false);
         let enc = encode_snapshot(&snap).unwrap();
-        for v in [0u8, 6, 255] {
+        for v in [0u8, 7, 255] {
             let r = decode_snapshot(v, &enc.payload, &mut no_resolver());
             assert_eq!(r.err(), Some(Error::UnsupportedVersion), "v{v}");
         }
@@ -1416,10 +1560,11 @@ mod tests {
         if std::env::var("TV_REGEN_GOLDEN").is_err() {
             return;
         }
-        let snap = attached_sample(true);
+        // v1–v5 are frozen; only the newest version's file may be (re)written.
+        let snap = passkey_sample(true);
         let enc = encode_snapshot(&snap).unwrap();
-        assert_eq!(enc.version, 5);
-        std::fs::write(GOLDEN_V5, &*enc.payload).unwrap();
+        assert_eq!(enc.version, 6);
+        std::fs::write(GOLDEN_V6, &*enc.payload).unwrap();
     }
 
     fn big_resolver(h: &str, size: u64) -> Result<Zeroizing<Vec<u8>>> {
@@ -1639,6 +1784,151 @@ mod tests {
         let bad = encode_at(&snap, 2).unwrap();
         assert_eq!(
             decode_snapshot(2, &bad.payload, &mut no_resolver()).err(),
+            Some(Error::Corrupted)
+        );
+    }
+
+    // ---- v6: passkeys (ADR 0020) ----
+
+    const GOLDEN_V6: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/snapshot_v6.postcard"
+    );
+
+    /// RFC 6979 §A.2.5 test key (a published, fake key).
+    const FAKE_KEY: [u8; 32] = [
+        0xc9, 0xaf, 0xa9, 0xd8, 0x45, 0xba, 0x75, 0x16, 0x6b, 0x5c, 0x21, 0x57, 0x67, 0xb1, 0xd6,
+        0x93, 0x4e, 0x50, 0xc3, 0xdb, 0x36, 0xe8, 0x9b, 0x12, 0x7b, 0x8a, 0x62, 0x2b, 0x12, 0x0f,
+        0x67, 0x21,
+    ];
+
+    fn passkey(id: &str, item: &str, deleted_at: Option<i64>) -> crate::models::Passkey {
+        crate::models::Passkey {
+            id: id.into(),
+            item_id: item.into(),
+            credential_id: vec![7; 16],
+            rp_id: "example.com".into(),
+            user_name: "ana@example.test".into(),
+            user_handle: vec![1, 2, 3, 4],
+            private_key: if deleted_at.is_some() {
+                Vec::new()
+            } else {
+                FAKE_KEY.to_vec()
+            },
+            created_at: 1_700_000_013_000,
+            updated_at: 1_700_000_014_000,
+            updated_by: "dev-a".into(),
+            deleted_at,
+        }
+    }
+
+    /// The v5 sample plus one live passkey and one tombstoned one (what the v6 golden file pins).
+    fn passkey_sample(big: bool) -> Snapshot {
+        let mut s = attached_sample(big);
+        s.passkeys.push(passkey("pk-1", "item-1", None));
+        s.passkeys
+            .push(passkey("pk-2", "item-1", Some(1_700_000_015_000)));
+        s
+    }
+
+    #[test]
+    fn passkeys_bump_to_v6_and_the_lower_versions_are_kept_otherwise() {
+        assert_eq!(encode_snapshot(&vaulted_sample(false)).unwrap().version, 4);
+        assert_eq!(encode_snapshot(&attached_sample(false)).unwrap().version, 5);
+        assert_eq!(encode_snapshot(&passkey_sample(false)).unwrap().version, 6);
+        // Passkeys without attachments still need v6 (v5's attachment list is just empty).
+        let mut s = vaulted_sample(false);
+        s.passkeys.push(passkey("pk-1", "item-1", None));
+        assert_eq!(encode_snapshot(&s).unwrap().version, 6);
+        assert_eq!(round_trip(&s), s);
+    }
+
+    #[test]
+    fn passkeys_round_trip_inline_without_side_blobs() {
+        let s = passkey_sample(false);
+        let enc = encode_snapshot(&s).unwrap();
+        // Only the attachment is a side blob.
+        assert_eq!(enc.external.len(), 1);
+        assert_eq!(round_trip(&s), s);
+        let refs = external_image_refs(6, &enc.payload).unwrap();
+        assert_eq!(refs, [(sha256_hex(&pattern(1_000)), 1_000)]);
+    }
+
+    #[test]
+    fn golden_v6_blob_decodes_to_the_expected_snapshot() {
+        let bytes = std::fs::read(GOLDEN_V6).unwrap();
+        let out = decode_snapshot(6, &bytes, &mut attach_resolver).unwrap();
+        assert_eq!(out, passkey_sample(true));
+    }
+
+    #[test]
+    fn current_encoder_still_produces_the_golden_v6_bytes() {
+        let bytes = std::fs::read(GOLDEN_V6).unwrap();
+        let snap = passkey_sample(true);
+        let enc = encode_snapshot(&snap).unwrap();
+        assert_eq!(enc.version, 6);
+        assert_eq!(*enc.payload, bytes);
+    }
+
+    #[test]
+    fn encode_rejects_malformed_passkeys() {
+        let cases: Vec<fn(&mut crate::models::Passkey)> = vec![
+            |p| p.private_key = vec![0; 32],
+            |p| p.private_key = vec![1; 31],
+            |p| p.private_key.clear(),
+            |p| p.rp_id = "Example.com".into(),
+            |p| p.rp_id = "bad domain".into(),
+            |p| p.user_handle.clear(),
+            |p| p.user_handle = vec![0; 65],
+            |p| p.credential_id.clear(),
+        ];
+        for (i, mutate) in cases.into_iter().enumerate() {
+            let mut s = passkey_sample(false);
+            mutate(&mut s.passkeys[0]);
+            assert_eq!(
+                encode_snapshot(&s).err(),
+                Some(Error::InvalidInput),
+                "case {i}"
+            );
+        }
+        // A tombstone must have been scrubbed.
+        let mut s = passkey_sample(false);
+        s.passkeys[1].private_key = FAKE_KEY.to_vec();
+        assert_eq!(encode_snapshot(&s).err(), Some(Error::InvalidInput));
+    }
+
+    #[test]
+    fn decode_rejects_a_passkey_of_an_unknown_item_or_a_damaged_key() {
+        let mut s = passkey_sample(false);
+        s.passkeys[0].item_id = "ghost".into();
+        let enc = encode_snapshot(&s).unwrap();
+        let r = decode_snapshot(6, &enc.payload, &mut attach_resolver);
+        assert_eq!(r.err(), Some(Error::Corrupted));
+
+        // Flip the encoded key into an invalid scalar (all 0xff) inside an otherwise valid payload.
+        let s = passkey_sample(false);
+        let enc = encode_snapshot(&s).unwrap();
+        let mut bytes = enc.payload.to_vec();
+        let at = bytes.windows(32).position(|w| w == FAKE_KEY).unwrap();
+        bytes[at..at + 32].fill(0xff);
+        let r = decode_snapshot(6, &bytes, &mut attach_resolver);
+        assert_eq!(r.err(), Some(Error::Corrupted));
+    }
+
+    #[test]
+    fn truncated_v6_payloads_are_corrupted_never_a_panic() {
+        let snap = passkey_sample(false);
+        let enc = encode_snapshot(&snap).unwrap();
+        for cut in [1usize, 5, 40] {
+            let short = &enc.payload[..enc.payload.len() - cut];
+            assert!(
+                decode_snapshot(6, short, &mut attach_resolver).is_err(),
+                "cut {cut}"
+            );
+        }
+        // A v5 reader would see trailing bytes: older builds never mis-read a v6 payload.
+        assert_eq!(
+            decode_snapshot(5, &enc.payload, &mut attach_resolver).err(),
             Some(Error::Corrupted)
         );
     }

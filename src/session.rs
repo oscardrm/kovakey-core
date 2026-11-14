@@ -858,6 +858,49 @@ mod tests {
     }
 
     #[test]
+    fn passkeys_sync_inside_the_encrypted_vault_and_sign_on_the_other_device() {
+        let (mut a, _) = new_mem();
+        let cdh = [0x24u8; 32];
+        let reg = a
+            .write(11, |st, ctx| {
+                st.register_passkey(ctx, None, "example.com", "ana", &[3; 8], &cdh)
+            })
+            .unwrap();
+        let key = a
+            .store()
+            .unwrap()
+            .passkey_secret(&reg.passkey_id)
+            .unwrap()
+            .1;
+        let sealed = a.export_vault().unwrap();
+        // v6 payload, no side blobs, and the key never appears in what the provider sees.
+        assert_eq!(sealed.file.get(crate::keys::HEADER_LEN), Some(&6));
+        assert!(sealed.side_blobs.is_empty());
+        assert!(!sealed.file.windows(32).any(|w| w == key.as_slice()));
+
+        let b = Session::<Database>::from_vault_file(
+            &sealed.file,
+            UnlockSecret::Password(PW),
+            "dev-b",
+            &|_| None,
+            |k| Database::open_in_memory(&k.db_key()?),
+        )
+        .unwrap();
+        let on_a = a
+            .store()
+            .unwrap()
+            .assert_passkey(&reg.passkey_id, &cdh)
+            .unwrap();
+        let on_b = b
+            .store()
+            .unwrap()
+            .assert_passkey(&reg.passkey_id, &cdh)
+            .unwrap();
+        // Same key, deterministic nonces: both devices produce the same signature.
+        assert_eq!(on_a, on_b);
+    }
+
+    #[test]
     fn two_devices_converge_through_exported_vault_files_across_backends() {
         let (mut a, _) = new_mem();
         let mail = add_login(&mut a, 10, "Mail", "fake-secret");

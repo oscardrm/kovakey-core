@@ -30,6 +30,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/004_trash.sql"),
     include_str!("migrations/005_vaults.sql"),
     include_str!("migrations/006_attachments.sql"),
+    include_str!("migrations/007_passkeys.sql"),
 ];
 
 /// Latest schema version known to this build.

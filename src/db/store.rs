@@ -29,7 +29,7 @@ use crate::ops::{
     bump, check_attachment_size, check_mime_type, check_vault_color, clean_vault_badge,
     clean_vault_name, new_id, non_empty, plan_field_update, sanitize_file_name, AttachmentInfo,
     BlockInput, CategoryUpdate, FieldInput, FieldView, ItemDetail, ItemSummary, ItemUpdate,
-    NewCategory, NewItem, VaultStore, VaultUpdate, WriteCtx, MAX_VAULTS,
+    NewCategory, NewItem, NewPasskey, PasskeyInfo, VaultStore, VaultUpdate, WriteCtx, MAX_VAULTS,
 };
 use crate::presets::seed_records;
 use crate::side_blob::sha256_hex;
@@ -757,6 +757,14 @@ impl Database {
             )
             .map_err(db_err)?;
         }
+        // Passkeys: tombstone and scrub the private key (ADR 0020).
+        tx.execute(
+            "UPDATE passkeys SET private_key=x'',deleted_at=max(?2,updated_at+1),
+               updated_at=max(?2,updated_at+1),updated_by=?3
+             WHERE item_id=?1 AND deleted_at IS NULL",
+            params![id, t, ctx.device_id],
+        )
+        .map_err(db_err)?;
         // Attachments: tombstone and scrub the bytes (ADR 0019).
         tx.execute(
             "UPDATE attachments SET data=x'',size=0,deleted_at=max(?2,updated_at+1),
@@ -1513,6 +1521,134 @@ impl Database {
     }
 }
 
+impl Database {
+    /// Store a passkey on a live, non-trashed item (ADR 0020).
+    pub fn add_passkey(
+        &mut self,
+        ctx: &WriteCtx<'_>,
+        item_id: &str,
+        new: &NewPasskey,
+    ) -> Result<String> {
+        let tx = self.begin(ctx)?;
+        live_item(&tx, item_id)?;
+        ensure_not_trashed(&tx, item_id)?;
+        // WebAuthn: a new credential for the same account replaces the old one.
+        tx.execute(
+            "UPDATE passkeys SET private_key=x'',deleted_at=max(?3,updated_at+1),
+               updated_at=max(?3,updated_at+1),updated_by=?4
+             WHERE rp_id=?1 AND user_handle=?2 AND deleted_at IS NULL",
+            params![new.rp_id, new.user_handle, ctx.now_ms, ctx.device_id],
+        )
+        .map_err(db_err)?;
+        let id = new_id(ctx)?;
+        tx.execute(
+            "INSERT INTO passkeys(id,item_id,credential_id,rp_id,user_name,user_handle,private_key,created_at,updated_at,updated_by)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?8,?9)",
+            params![
+                id,
+                item_id,
+                new.credential_id,
+                new.rp_id,
+                new.user_name,
+                new.user_handle,
+                new.private_key.as_slice(),
+                ctx.now_ms,
+                ctx.device_id
+            ],
+        )
+        .map_err(db_err)?;
+        tx.commit().map_err(db_err)?;
+        Ok(id)
+    }
+
+    /// Live passkeys of an item, oldest first (metadata only).
+    pub fn list_passkeys(&self, item_id: &str) -> Result<Vec<PasskeyInfo>> {
+        live_item(self.conn(), item_id)?;
+        let mut stmt = self
+            .conn()
+            .prepare(
+                "SELECT id,item_id,credential_id,rp_id,user_name,user_handle,created_at,updated_at
+                 FROM passkeys WHERE item_id=?1 AND deleted_at IS NULL ORDER BY created_at,id",
+            )
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map([item_id], read_passkey_info)
+            .map_err(db_err)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(db_err)
+    }
+
+    /// Live passkeys for a relying party on non-trashed items, newest first.
+    pub fn passkeys_for_rp(&self, rp_id: &str) -> Result<Vec<PasskeyInfo>> {
+        let Ok(rp_id) = crate::passkey::normalize_rp_id(rp_id) else {
+            return Ok(Vec::new());
+        };
+        let mut stmt = self
+            .conn()
+            .prepare(
+                "SELECT p.id,p.item_id,p.credential_id,p.rp_id,p.user_name,p.user_handle,p.created_at,p.updated_at
+                 FROM passkeys p JOIN items i ON i.id=p.item_id
+                 WHERE p.rp_id=?1 AND p.deleted_at IS NULL AND i.deleted_at IS NULL AND i.trashed_at IS NULL
+                 ORDER BY p.created_at DESC,p.id DESC",
+            )
+            .map_err(db_err)?;
+        let rows = stmt.query_map([rp_id], read_passkey_info).map_err(db_err)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(db_err)
+    }
+
+    /// Metadata and private key of a usable passkey (core-internal).
+    pub fn passkey_secret(&self, id: &str) -> Result<(PasskeyInfo, Zeroizing<Vec<u8>>)> {
+        let (info, key) = self
+            .conn()
+            .query_row(
+                "SELECT p.id,p.item_id,p.credential_id,p.rp_id,p.user_name,p.user_handle,p.created_at,p.updated_at,p.private_key
+                 FROM passkeys p JOIN items i ON i.id=p.item_id
+                 WHERE p.id=?1 AND p.deleted_at IS NULL AND i.deleted_at IS NULL AND i.trashed_at IS NULL",
+                [id],
+                |r| Ok((read_passkey_info(r)?, Zeroizing::new(r.get::<_, Vec<u8>>(8)?))),
+            )
+            .optional()
+            .map_err(db_err)?
+            .ok_or(Error::NotFound)?;
+        Ok((info, key))
+    }
+
+    /// Tombstone a passkey and scrub its key.
+    pub fn delete_passkey(&mut self, ctx: &WriteCtx<'_>, id: &str) -> Result<()> {
+        let tx = self.begin(ctx)?;
+        let prev: i64 = tx
+            .query_row(
+                "SELECT updated_at FROM passkeys WHERE id=?1 AND deleted_at IS NULL",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(db_err)?
+            .ok_or(Error::NotFound)?;
+        let t = bump(prev, ctx.now_ms);
+        tx.execute(
+            "UPDATE passkeys SET private_key=x'',deleted_at=?2,updated_at=?2,updated_by=?3 WHERE id=?1",
+            params![id, t, ctx.device_id],
+        )
+        .map_err(db_err)?;
+        tx.commit().map_err(db_err)
+    }
+}
+
+fn read_passkey_info(r: &rusqlite::Row<'_>) -> rusqlite::Result<PasskeyInfo> {
+    Ok(PasskeyInfo {
+        id: r.get(0)?,
+        item_id: r.get(1)?,
+        credential_id: r.get(2)?,
+        rp_id: r.get(3)?,
+        user_name: r.get(4)?,
+        user_handle: r.get(5)?,
+        created_at: r.get(6)?,
+        updated_at: r.get(7)?,
+    })
+}
+
 fn read_attachment_info(r: &rusqlite::Row<'_>) -> rusqlite::Result<AttachmentInfo> {
     Ok(AttachmentInfo {
         id: r.get(0)?,
@@ -1691,6 +1827,11 @@ impl VaultStore for Database {
         fn read_attachment(&Self, id: &str) -> Result<(AttachmentInfo, Zeroizing<Vec<u8>>)>;
         fn rename_attachment(&mut Self, ctx: &WriteCtx<'_>, id: &str, file_name: &str) -> Result<()>;
         fn delete_attachment(&mut Self, ctx: &WriteCtx<'_>, id: &str) -> Result<()>;
+        fn add_passkey(&mut Self, ctx: &WriteCtx<'_>, item_id: &str, new: &NewPasskey) -> Result<String>;
+        fn list_passkeys(&Self, item_id: &str) -> Result<Vec<PasskeyInfo>>;
+        fn passkeys_for_rp(&Self, rp_id: &str) -> Result<Vec<PasskeyInfo>>;
+        fn passkey_secret(&Self, id: &str) -> Result<(PasskeyInfo, Zeroizing<Vec<u8>>)>;
+        fn delete_passkey(&mut Self, ctx: &WriteCtx<'_>, id: &str) -> Result<()>;
         fn merge_remote(&mut Self, remote: &Snapshot) -> Result<()>;
     }
 

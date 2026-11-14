@@ -21,6 +21,7 @@ pub mod merge;
 pub mod models;
 pub mod notes;
 pub mod ops;
+pub mod passkey;
 pub mod presets;
 pub mod recovery;
 pub mod search;

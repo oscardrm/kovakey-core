@@ -16,14 +16,14 @@ use crate::error::{Error, Result};
 use crate::merge::merge;
 use crate::models::{
     Attachment, BlockKind, Category, CategoryField, HistoryEntry, Item, ItemField, ItemTag,
-    NoteBlock, NoteImage, Snapshot, Tag, VaultMeta, DEFAULT_VAULT_ID,
+    NoteBlock, NoteImage, Passkey, Snapshot, Tag, VaultMeta, DEFAULT_VAULT_ID,
 };
 use crate::notes::detect_language;
 use crate::ops::{
     bump, check_attachment_size, check_mime_type, check_vault_color, clean_vault_badge,
     clean_vault_name, new_id, non_empty, plan_field_update, sanitize_file_name, AttachmentInfo,
     BlockInput, CategoryUpdate, FieldInput, FieldView, ItemDetail, ItemSummary, ItemUpdate,
-    NewCategory, NewItem, VaultStore, VaultUpdate, WriteCtx, MAX_VAULTS,
+    NewCategory, NewItem, NewPasskey, PasskeyInfo, VaultStore, VaultUpdate, WriteCtx, MAX_VAULTS,
 };
 use crate::presets::seed_records;
 use crate::side_blob::sha256_hex;
@@ -79,6 +79,9 @@ fn check_integrity(s: &Snapshot) -> Result<()> {
         && s.attachments
             .iter()
             .all(|a| items.contains(a.item_id.as_str()))
+        && s.passkeys
+            .iter()
+            .all(|p| items.contains(p.item_id.as_str()))
         && s.item_fields
             .iter()
             .all(|f| items.contains(f.item_id.as_str()))
@@ -94,6 +97,28 @@ fn check_integrity(s: &Snapshot) -> Result<()> {
     } else {
         Err(Error::Corrupted)
     }
+}
+
+fn passkey_info(p: &Passkey) -> PasskeyInfo {
+    PasskeyInfo {
+        id: p.id.clone(),
+        item_id: p.item_id.clone(),
+        credential_id: p.credential_id.clone(),
+        rp_id: p.rp_id.clone(),
+        user_name: p.user_name.clone(),
+        user_handle: p.user_handle.clone(),
+        created_at: p.created_at,
+        updated_at: p.updated_at,
+    }
+}
+
+/// Tombstone a passkey at `t` and scrub its key.
+fn tombstone_passkey(p: &mut Passkey, t: i64, device_id: &str) {
+    p.private_key.zeroize();
+    p.private_key.clear();
+    p.deleted_at = Some(t);
+    p.updated_at = t;
+    p.updated_by = device_id.to_string();
 }
 
 fn attachment_info(a: &Attachment) -> AttachmentInfo {
@@ -548,6 +573,14 @@ impl MemStore {
         }
     }
 
+    /// Whether `item_id` is a live item outside the Trash.
+    fn usable(&self, item_id: &str) -> bool {
+        self.snap
+            .items
+            .iter()
+            .any(|i| i.id == item_id && i.deleted_at.is_none() && i.trashed_at.is_none())
+    }
+
     fn item(&self, id: &str) -> Result<&Item> {
         self.snap
             .items
@@ -682,6 +715,14 @@ impl VaultStore for MemStore {
                 l.deleted_at = Some(lt);
                 l.updated_at = lt;
                 l.updated_by = ctx.device_id.to_string();
+            }
+            for p in s
+                .passkeys
+                .iter_mut()
+                .filter(|p| p.item_id == id && p.deleted_at.is_none())
+            {
+                let pt = t.max(p.updated_at.saturating_add(1));
+                tombstone_passkey(p, pt, ctx.device_id);
             }
             for a in s
                 .attachments
@@ -1389,6 +1430,90 @@ impl VaultStore for MemStore {
             a.deleted_at = Some(t);
             a.updated_at = t;
             a.updated_by = ctx.device_id.to_string();
+            Ok(())
+        })
+    }
+
+    fn add_passkey(
+        &mut self,
+        ctx: &WriteCtx<'_>,
+        item_id: &str,
+        new: &NewPasskey,
+    ) -> Result<String> {
+        self.tx(ctx, |s| {
+            active_item(s, item_id)?;
+            // WebAuthn: a new credential for the same account replaces the old one.
+            for p in s.passkeys.iter_mut().filter(|p| {
+                p.deleted_at.is_none() && p.rp_id == new.rp_id && p.user_handle == new.user_handle
+            }) {
+                let t = ctx.now_ms.max(p.updated_at.saturating_add(1));
+                tombstone_passkey(p, t, ctx.device_id);
+            }
+            let id = new_id(ctx)?;
+            s.passkeys.push(Passkey {
+                id: id.clone(),
+                item_id: item_id.to_string(),
+                credential_id: new.credential_id.clone(),
+                rp_id: new.rp_id.clone(),
+                user_name: new.user_name.clone(),
+                user_handle: new.user_handle.clone(),
+                private_key: new.private_key.to_vec(),
+                created_at: ctx.now_ms,
+                updated_at: ctx.now_ms,
+                updated_by: ctx.device_id.to_string(),
+                deleted_at: None,
+            });
+            Ok(id)
+        })
+    }
+
+    fn list_passkeys(&self, item_id: &str) -> Result<Vec<PasskeyInfo>> {
+        self.item(item_id)?;
+        let mut out: Vec<PasskeyInfo> = self
+            .snap
+            .passkeys
+            .iter()
+            .filter(|p| p.item_id == item_id && p.deleted_at.is_none())
+            .map(passkey_info)
+            .collect();
+        out.sort_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)));
+        Ok(out)
+    }
+
+    fn passkeys_for_rp(&self, rp_id: &str) -> Result<Vec<PasskeyInfo>> {
+        let Ok(rp_id) = crate::passkey::normalize_rp_id(rp_id) else {
+            return Ok(Vec::new());
+        };
+        let mut out: Vec<PasskeyInfo> = self
+            .snap
+            .passkeys
+            .iter()
+            .filter(|p| p.rp_id == rp_id && p.deleted_at.is_none() && self.usable(&p.item_id))
+            .map(passkey_info)
+            .collect();
+        out.sort_by(|a, b| (b.created_at, &b.id).cmp(&(a.created_at, &a.id)));
+        Ok(out)
+    }
+
+    fn passkey_secret(&self, id: &str) -> Result<(PasskeyInfo, Zeroizing<Vec<u8>>)> {
+        let p = self
+            .snap
+            .passkeys
+            .iter()
+            .find(|p| p.id == id && p.deleted_at.is_none() && self.usable(&p.item_id))
+            .ok_or(Error::NotFound)?;
+        Ok((passkey_info(p), Zeroizing::new(p.private_key.clone())))
+    }
+
+    fn delete_passkey(&mut self, ctx: &WriteCtx<'_>, id: &str) -> Result<()> {
+        self.tx(ctx, |s| {
+            let p = s
+                .passkeys
+                .iter_mut()
+                .find(|p| p.id == id && p.deleted_at.is_none())
+                .ok_or(Error::NotFound)?;
+            let t = bump(p.updated_at, ctx.now_ms);
+            tombstone_passkey(p, t, ctx.device_id);
             Ok(())
         })
     }

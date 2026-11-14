@@ -20,8 +20,8 @@
 use std::collections::BTreeMap;
 
 use crate::models::{
-    Attachment, Category, CategoryField, Item, ItemField, ItemTag, NoteBlock, NoteImage, Snapshot,
-    Tag, VaultMeta, DEFAULT_VAULT_ID,
+    Attachment, Category, CategoryField, Item, ItemField, ItemTag, NoteBlock, NoteImage, Passkey,
+    Snapshot, Tag, VaultMeta, DEFAULT_VAULT_ID,
 };
 
 /// A record that participates in LWW merge.
@@ -142,6 +142,7 @@ pub fn merge(local: &Snapshot, remote: &Snapshot) -> Snapshot {
         note_blocks: merge_records(&local.note_blocks, &remote.note_blocks),
         note_images: merge_images(&local.note_images, &remote.note_images),
         attachments: merge_records(&local.attachments, &remote.attachments),
+        passkeys: merge_records(&local.passkeys, &remote.passkeys),
     };
     heal_vaults(&mut merged);
     merged
@@ -161,7 +162,8 @@ pub fn max_future_skew(s: &Snapshot, now_ms: i64) -> i64 {
         .chain(s.item_fields.iter().map(|r| r.updated_at))
         .chain(s.item_tags.iter().map(|r| r.updated_at))
         .chain(s.note_blocks.iter().map(|r| r.updated_at))
-        .chain(s.attachments.iter().map(|r| r.updated_at));
+        .chain(s.attachments.iter().map(|r| r.updated_at))
+        .chain(s.passkeys.iter().map(|r| r.updated_at));
     times.map(|t| t - now_ms).max().unwrap_or(0).max(0)
 }
 
@@ -188,7 +190,8 @@ versioned_by_id!(
     ItemField,
     NoteBlock,
     VaultMeta,
-    Attachment
+    Attachment,
+    Passkey
 );
 
 impl Versioned for ItemTag {

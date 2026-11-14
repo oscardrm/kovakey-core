@@ -28,6 +28,8 @@ data-encoding = "2"
 hmac = "0.12"
 sha1 = "0.10"
 uuid = { version = "1", features = ["v7"] }
+# Passkeys (ADR 0020): ES256 key generation and signing only. Unaudited (owner-accepted exception).
+p256 = { version = "=0.14.0", default-features = false, features = ["ecdsa"] }
 # Snapshot wire format (ADR 0001): compact, deterministic, no_std-friendly, wasm-safe.
 serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
 postcard = { version = "1", default-features = false, features = ["alloc"] }
