@@ -491,10 +491,104 @@ pub trait VaultStore {
     ) -> Result<String>;
     /// MIME type and bytes of a stored note image.
     fn note_image(&self, id: &str) -> Result<(String, Zeroizing<Vec<u8>>)>;
+    /// Attach a file to a live item; returns the attachment id. The name is sanitized, the MIME
+    /// type validated and the per-file / per-vault limits enforced (ADR 0019).
+    fn add_attachment(
+        &mut self,
+        ctx: &WriteCtx<'_>,
+        item_id: &str,
+        file_name: &str,
+        mime_type: &str,
+        data: &[u8],
+    ) -> Result<String>;
+    /// Live attachments of an item (metadata only), oldest first.
+    fn list_attachments(&self, item_id: &str) -> Result<Vec<AttachmentInfo>>;
+    /// Metadata and bytes of a live attachment.
+    fn read_attachment(&self, id: &str) -> Result<(AttachmentInfo, Zeroizing<Vec<u8>>)>;
+    /// Rename a live attachment (sanitized).
+    fn rename_attachment(&mut self, ctx: &WriteCtx<'_>, id: &str, file_name: &str) -> Result<()>;
+    /// Tombstone an attachment and scrub its bytes.
+    fn delete_attachment(&mut self, ctx: &WriteCtx<'_>, id: &str) -> Result<()>;
     /// The whole vault as a merge snapshot.
     fn snapshot(&self) -> Result<Snapshot>;
     /// Merge a decrypted remote snapshot atomically.
     fn merge_remote(&mut self, remote: &Snapshot) -> Result<()>;
+}
+
+/// Non-secret view of an attachment (ADR 0019); the bytes come from `read_attachment`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AttachmentInfo {
+    /// Attachment id.
+    pub id: String,
+    /// Owning item.
+    pub item_id: String,
+    /// Sanitized file name.
+    pub file_name: String,
+    /// MIME type as declared when it was added.
+    pub mime_type: String,
+    /// Size in bytes.
+    pub size: u64,
+    /// Creation time, Unix ms UTC.
+    pub created_at: i64,
+    /// Last modification time, Unix ms UTC.
+    pub updated_at: i64,
+}
+
+/// Longest stored file name, in bytes.
+pub const MAX_FILE_NAME_BYTES: usize = 255;
+
+/// Turn an externally supplied file name into a safe display name: keeps only the last path
+/// component, drops control characters and bidirectional overrides (which can disguise an
+/// extension), trims surrounding spaces and dots, and caps the length. An empty result is
+/// [`Error::InvalidInput`]. The name is never used to build a path inside the core.
+pub fn sanitize_file_name(raw: &str) -> Result<String> {
+    let last = raw.rsplit(['/', '\\']).next().unwrap_or("");
+    let cleaned: String = last
+        .chars()
+        .filter(|c| {
+            !c.is_control() && !matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+        })
+        .collect();
+    let trimmed = cleaned.trim_matches(|c: char| c == '.' || c.is_whitespace());
+    let mut out = String::new();
+    for c in trimmed.chars() {
+        if out.len() + c.len_utf8() > MAX_FILE_NAME_BYTES {
+            break;
+        }
+        out.push(c);
+    }
+    if out.is_empty() {
+        return Err(Error::InvalidInput);
+    }
+    Ok(out)
+}
+
+/// Accept only a plain `type/subtype` MIME string (ASCII graphic, at most 127 bytes). It is stored
+/// for display and export hints; the core never picks behavior from it.
+pub fn check_mime_type(mime: &str) -> Result<()> {
+    let ok = !mime.is_empty()
+        && mime.len() <= 127
+        && mime.bytes().all(|b| b.is_ascii_graphic())
+        && mime.matches('/').count() == 1
+        && !mime.starts_with('/')
+        && !mime.ends_with('/');
+    if ok {
+        Ok(())
+    } else {
+        Err(Error::InvalidInput)
+    }
+}
+
+/// Enforce the per-file and per-vault attachment limits (ADR 0019). `live_total` is the number of
+/// bytes already held by live attachments.
+pub fn check_attachment_size(len: usize, live_total: u64) -> Result<()> {
+    if len == 0 || len > crate::models::MAX_ATTACHMENT_BYTES {
+        return Err(Error::InvalidInput);
+    }
+    if live_total.saturating_add(len as u64) > crate::models::MAX_VAULT_ATTACHMENT_BYTES {
+        return Err(Error::InvalidInput);
+    }
+    Ok(())
 }
 
 /// Validate a category field input and turn it into a record body.

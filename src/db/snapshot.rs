@@ -18,8 +18,8 @@ use super::{db_err, Database};
 use crate::error::{Error, Result};
 use crate::merge::merge;
 use crate::models::{
-    BlockKind, Category, CategoryField, HistoryEntry, Item, ItemField, ItemTag, ItemType,
-    NoteBlock, NoteImage, Snapshot, Tag, VaultMeta,
+    Attachment, BlockKind, Category, CategoryField, HistoryEntry, Item, ItemField, ItemTag,
+    ItemType, NoteBlock, NoteImage, Snapshot, Tag, VaultMeta,
 };
 
 fn corrupt(idx: usize, e: Error) -> rusqlite::Error {
@@ -228,6 +228,28 @@ fn read_all(conn: &Connection) -> Result<Snapshot> {
             })
         },
     )?;
+    let attachments = query(
+        conn,
+        "SELECT id,item_id,file_name,mime_type,size,data,created_at,updated_at,updated_by,deleted_at
+         FROM attachments ORDER BY id",
+        |r| {
+            let data: Vec<u8> = r.get(5)?;
+            Ok(Attachment {
+                id: r.get(0)?,
+                item_id: r.get(1)?,
+                file_name: r.get(2)?,
+                mime_type: r.get(3)?,
+                // Hash is derived from the bytes, never read back from a column.
+                sha256: sha256_hex(&data),
+                size: data.len() as u64,
+                data,
+                created_at: r.get(6)?,
+                updated_at: r.get(7)?,
+                updated_by: r.get(8)?,
+                deleted_at: r.get(9)?,
+            })
+        },
+    )?;
     Ok(Snapshot {
         vault_meta,
         categories,
@@ -238,6 +260,7 @@ fn read_all(conn: &Connection) -> Result<Snapshot> {
         item_tags,
         note_blocks,
         note_images,
+        attachments,
     })
 }
 
@@ -414,6 +437,31 @@ fn write_all(conn: &Connection, snap: &Snapshot) -> Result<()> {
                 l.updated_at,
                 l.updated_by,
                 l.deleted_at
+            ],
+        )
+        .map_err(db_err)?;
+    }
+    for a in &snap.attachments {
+        conn.execute(
+            "INSERT INTO attachments(id,item_id,file_name,mime_type,sha256,size,data,created_at,updated_at,updated_by,deleted_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
+             ON CONFLICT(id) DO UPDATE SET item_id=excluded.item_id,file_name=excluded.file_name,
+               mime_type=excluded.mime_type,sha256=excluded.sha256,size=excluded.size,
+               data=excluded.data,updated_at=excluded.updated_at,updated_by=excluded.updated_by,
+               deleted_at=excluded.deleted_at
+             WHERE (excluded.updated_at,excluded.updated_by) >= (attachments.updated_at,attachments.updated_by)",
+            params![
+                a.id,
+                a.item_id,
+                a.file_name,
+                a.mime_type,
+                sha256_hex(&a.data),
+                a.data.len() as i64,
+                a.data,
+                a.created_at,
+                a.updated_at,
+                a.updated_by,
+                a.deleted_at
             ],
         )
         .map_err(db_err)?;

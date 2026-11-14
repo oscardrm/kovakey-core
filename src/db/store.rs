@@ -26,9 +26,10 @@ use crate::models::{
 };
 use crate::notes::detect_language;
 use crate::ops::{
-    bump, check_vault_color, clean_vault_badge, clean_vault_name, new_id, non_empty,
-    plan_field_update, BlockInput, CategoryUpdate, FieldInput, FieldView, ItemDetail, ItemSummary,
-    ItemUpdate, NewCategory, NewItem, VaultStore, VaultUpdate, WriteCtx, MAX_VAULTS,
+    bump, check_attachment_size, check_mime_type, check_vault_color, clean_vault_badge,
+    clean_vault_name, new_id, non_empty, plan_field_update, sanitize_file_name, AttachmentInfo,
+    BlockInput, CategoryUpdate, FieldInput, FieldView, ItemDetail, ItemSummary, ItemUpdate,
+    NewCategory, NewItem, VaultStore, VaultUpdate, WriteCtx, MAX_VAULTS,
 };
 use crate::presets::seed_records;
 use crate::side_blob::sha256_hex;
@@ -756,6 +757,14 @@ impl Database {
             )
             .map_err(db_err)?;
         }
+        // Attachments: tombstone and scrub the bytes (ADR 0019).
+        tx.execute(
+            "UPDATE attachments SET data=x'',size=0,deleted_at=max(?2,updated_at+1),
+               updated_at=max(?2,updated_at+1),updated_by=?3
+             WHERE item_id=?1 AND deleted_at IS NULL",
+            params![id, t, ctx.device_id],
+        )
+        .map_err(db_err)?;
         tx.execute(
             "UPDATE item_tags SET deleted_at=max(?2,updated_at+1),updated_at=max(?2,updated_at+1),updated_by=?3
              WHERE item_id=?1 AND deleted_at IS NULL",
@@ -1367,6 +1376,129 @@ impl Database {
         Ok(id)
     }
 
+    /// Attach a file to a live item (ADR 0019).
+    pub fn add_attachment(
+        &mut self,
+        ctx: &WriteCtx<'_>,
+        item_id: &str,
+        file_name: &str,
+        mime_type: &str,
+        data: &[u8],
+    ) -> Result<String> {
+        let name = sanitize_file_name(file_name)?;
+        check_mime_type(mime_type)?;
+        let tx = self.begin(ctx)?;
+        live_item(&tx, item_id)?;
+        let live_total: i64 = tx
+            .query_row(
+                "SELECT COALESCE(SUM(size),0) FROM attachments WHERE deleted_at IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(db_err)?;
+        check_attachment_size(data.len(), u64::try_from(live_total).unwrap_or(u64::MAX))?;
+        let id = new_id(ctx)?;
+        tx.execute(
+            "INSERT INTO attachments(id,item_id,file_name,mime_type,sha256,size,data,created_at,updated_at,updated_by)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?8,?9)",
+            params![
+                id,
+                item_id,
+                name,
+                mime_type,
+                sha256_hex(data),
+                data.len() as i64,
+                data,
+                ctx.now_ms,
+                ctx.device_id
+            ],
+        )
+        .map_err(db_err)?;
+        tx.commit().map_err(db_err)?;
+        Ok(id)
+    }
+
+    /// Live attachments of an item, oldest first (metadata only).
+    pub fn list_attachments(&self, item_id: &str) -> Result<Vec<AttachmentInfo>> {
+        live_item(self.conn(), item_id)?;
+        let mut stmt = self
+            .conn()
+            .prepare(
+                "SELECT id,item_id,file_name,mime_type,size,created_at,updated_at FROM attachments
+                 WHERE item_id=?1 AND deleted_at IS NULL ORDER BY created_at,id",
+            )
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map([item_id], read_attachment_info)
+            .map_err(db_err)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(db_err)
+    }
+
+    /// Metadata and bytes of a live attachment.
+    pub fn read_attachment(&self, id: &str) -> Result<(AttachmentInfo, Zeroizing<Vec<u8>>)> {
+        let (info, data) = self
+            .conn()
+            .query_row(
+                "SELECT a.id,a.item_id,a.file_name,a.mime_type,a.size,a.created_at,a.updated_at,a.data
+                 FROM attachments a JOIN items i ON i.id=a.item_id
+                 WHERE a.id=?1 AND a.deleted_at IS NULL AND i.deleted_at IS NULL",
+                [id],
+                |r| Ok((read_attachment_info(r)?, r.get::<_, Vec<u8>>(7)?)),
+            )
+            .optional()
+            .map_err(db_err)?
+            .ok_or(Error::NotFound)?;
+        Ok((info, Zeroizing::new(data)))
+    }
+
+    /// Rename a live attachment.
+    pub fn rename_attachment(
+        &mut self,
+        ctx: &WriteCtx<'_>,
+        id: &str,
+        file_name: &str,
+    ) -> Result<()> {
+        let name = sanitize_file_name(file_name)?;
+        let tx = self.begin(ctx)?;
+        let prev: i64 = tx
+            .query_row(
+                "SELECT updated_at FROM attachments WHERE id=?1 AND deleted_at IS NULL",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(db_err)?
+            .ok_or(Error::NotFound)?;
+        tx.execute(
+            "UPDATE attachments SET file_name=?2,updated_at=?3,updated_by=?4 WHERE id=?1",
+            params![id, name, bump(prev, ctx.now_ms), ctx.device_id],
+        )
+        .map_err(db_err)?;
+        tx.commit().map_err(db_err)
+    }
+
+    /// Tombstone an attachment and scrub its bytes.
+    pub fn delete_attachment(&mut self, ctx: &WriteCtx<'_>, id: &str) -> Result<()> {
+        let tx = self.begin(ctx)?;
+        let prev: i64 = tx
+            .query_row(
+                "SELECT updated_at FROM attachments WHERE id=?1 AND deleted_at IS NULL",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(db_err)?
+            .ok_or(Error::NotFound)?;
+        let t = bump(prev, ctx.now_ms);
+        tx.execute(
+            "UPDATE attachments SET data=x'',size=0,deleted_at=?2,updated_at=?2,updated_by=?3 WHERE id=?1",
+            params![id, t, ctx.device_id],
+        )
+        .map_err(db_err)?;
+        tx.commit().map_err(db_err)
+    }
+
     /// SHA-256 (hex) of a stored image, for content-addressing by the blob codec.
     pub fn note_image_sha256(&self, id: &str) -> Result<String> {
         let data: Vec<u8> = self
@@ -1379,6 +1511,18 @@ impl Database {
             .ok_or(Error::NotFound)?;
         Ok(sha256_hex(&data))
     }
+}
+
+fn read_attachment_info(r: &rusqlite::Row<'_>) -> rusqlite::Result<AttachmentInfo> {
+    Ok(AttachmentInfo {
+        id: r.get(0)?,
+        item_id: r.get(1)?,
+        file_name: r.get(2)?,
+        mime_type: r.get(3)?,
+        size: u64::try_from(r.get::<_, i64>(4)?).unwrap_or(0),
+        created_at: r.get(5)?,
+        updated_at: r.get(6)?,
+    })
 }
 
 fn read_tag(conn: &Connection, id: &str) -> Result<Tag> {
@@ -1542,6 +1686,11 @@ impl VaultStore for Database {
         fn seed_default_categories(&mut Self, ctx: &WriteCtx<'_>) -> Result<()>;
         fn add_note_image(&mut Self, ctx: &WriteCtx<'_>, mime_type: &str, data: &[u8]) -> Result<String>;
         fn note_image(&Self, id: &str) -> Result<(String, Zeroizing<Vec<u8>>)>;
+        fn add_attachment(&mut Self, ctx: &WriteCtx<'_>, item_id: &str, file_name: &str, mime_type: &str, data: &[u8]) -> Result<String>;
+        fn list_attachments(&Self, item_id: &str) -> Result<Vec<AttachmentInfo>>;
+        fn read_attachment(&Self, id: &str) -> Result<(AttachmentInfo, Zeroizing<Vec<u8>>)>;
+        fn rename_attachment(&mut Self, ctx: &WriteCtx<'_>, id: &str, file_name: &str) -> Result<()>;
+        fn delete_attachment(&mut Self, ctx: &WriteCtx<'_>, id: &str) -> Result<()>;
         fn merge_remote(&mut Self, remote: &Snapshot) -> Result<()>;
     }
 

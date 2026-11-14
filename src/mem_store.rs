@@ -15,14 +15,15 @@ use zeroize::{Zeroize, Zeroizing};
 use crate::error::{Error, Result};
 use crate::merge::merge;
 use crate::models::{
-    BlockKind, Category, CategoryField, HistoryEntry, Item, ItemField, ItemTag, NoteBlock,
-    NoteImage, Snapshot, Tag, VaultMeta, DEFAULT_VAULT_ID,
+    Attachment, BlockKind, Category, CategoryField, HistoryEntry, Item, ItemField, ItemTag,
+    NoteBlock, NoteImage, Snapshot, Tag, VaultMeta, DEFAULT_VAULT_ID,
 };
 use crate::notes::detect_language;
 use crate::ops::{
-    bump, check_vault_color, clean_vault_badge, clean_vault_name, new_id, non_empty,
-    plan_field_update, BlockInput, CategoryUpdate, FieldInput, FieldView, ItemDetail, ItemSummary,
-    ItemUpdate, NewCategory, NewItem, VaultStore, VaultUpdate, WriteCtx, MAX_VAULTS,
+    bump, check_attachment_size, check_mime_type, check_vault_color, clean_vault_badge,
+    clean_vault_name, new_id, non_empty, plan_field_update, sanitize_file_name, AttachmentInfo,
+    BlockInput, CategoryUpdate, FieldInput, FieldView, ItemDetail, ItemSummary, ItemUpdate,
+    NewCategory, NewItem, VaultStore, VaultUpdate, WriteCtx, MAX_VAULTS,
 };
 use crate::presets::seed_records;
 use crate::side_blob::sha256_hex;
@@ -75,6 +76,9 @@ fn check_integrity(s: &Snapshot) -> Result<()> {
         && s.category_fields
             .iter()
             .all(|f| cats.contains(f.category_id.as_str()))
+        && s.attachments
+            .iter()
+            .all(|a| items.contains(a.item_id.as_str()))
         && s.item_fields
             .iter()
             .all(|f| items.contains(f.item_id.as_str()))
@@ -89,6 +93,18 @@ fn check_integrity(s: &Snapshot) -> Result<()> {
         Ok(())
     } else {
         Err(Error::Corrupted)
+    }
+}
+
+fn attachment_info(a: &Attachment) -> AttachmentInfo {
+    AttachmentInfo {
+        id: a.id.clone(),
+        item_id: a.item_id.clone(),
+        file_name: a.file_name.clone(),
+        mime_type: a.mime_type.clone(),
+        size: a.size,
+        created_at: a.created_at,
+        updated_at: a.updated_at,
     }
 }
 
@@ -508,12 +524,17 @@ impl MemStore {
         f: impl FnOnce(&mut Snapshot) -> Result<R>,
     ) -> Result<R> {
         begin(ctx)?;
+        // Large byte payloads are moved, not cloned, into the working copy. Writers validate
+        // before they mutate, so an error never leaves a half-applied change behind.
         let images = mem::take(&mut self.snap.note_images);
+        let attachments = mem::take(&mut self.snap.attachments);
         let mut work = Snapshot {
             note_images: Vec::new(),
+            attachments: Vec::new(),
             ..self.snap.clone()
         };
         work.note_images = images;
+        work.attachments = attachments;
         match f(&mut work) {
             Ok(r) => {
                 self.snap = work;
@@ -521,6 +542,7 @@ impl MemStore {
             }
             Err(e) => {
                 self.snap.note_images = mem::take(&mut work.note_images);
+                self.snap.attachments = mem::take(&mut work.attachments);
                 Err(e)
             }
         }
@@ -660,6 +682,20 @@ impl VaultStore for MemStore {
                 l.deleted_at = Some(lt);
                 l.updated_at = lt;
                 l.updated_by = ctx.device_id.to_string();
+            }
+            for a in s
+                .attachments
+                .iter_mut()
+                .filter(|a| a.item_id == id && a.deleted_at.is_none())
+            {
+                let at = t.max(a.updated_at.saturating_add(1));
+                a.data.zeroize();
+                a.data.clear();
+                a.size = 0;
+                a.sha256 = sha256_hex(&[]);
+                a.deleted_at = Some(at);
+                a.updated_at = at;
+                a.updated_by = ctx.device_id.to_string();
             }
             let it = live_item(s, id)?;
             it.deleted_at = Some(t);
@@ -1260,6 +1296,101 @@ impl VaultStore for MemStore {
             .find(|i| i.id == id)
             .map(|i| (i.mime_type.clone(), Zeroizing::new(i.data.clone())))
             .ok_or(Error::NotFound)
+    }
+
+    fn add_attachment(
+        &mut self,
+        ctx: &WriteCtx<'_>,
+        item_id: &str,
+        file_name: &str,
+        mime_type: &str,
+        data: &[u8],
+    ) -> Result<String> {
+        let name = sanitize_file_name(file_name)?;
+        check_mime_type(mime_type)?;
+        self.tx(ctx, |s| {
+            live_item(s, item_id)?;
+            let live_total: u64 = s
+                .attachments
+                .iter()
+                .filter(|a| a.deleted_at.is_none())
+                .map(|a| a.size)
+                .sum();
+            check_attachment_size(data.len(), live_total)?;
+            let id = new_id(ctx)?;
+            s.attachments.push(Attachment {
+                id: id.clone(),
+                item_id: item_id.to_string(),
+                file_name: name,
+                mime_type: mime_type.to_string(),
+                sha256: sha256_hex(data),
+                size: data.len() as u64,
+                data: data.to_vec(),
+                created_at: ctx.now_ms,
+                updated_at: ctx.now_ms,
+                updated_by: ctx.device_id.to_string(),
+                deleted_at: None,
+            });
+            Ok(id)
+        })
+    }
+
+    fn list_attachments(&self, item_id: &str) -> Result<Vec<AttachmentInfo>> {
+        self.item(item_id)?;
+        let mut out: Vec<AttachmentInfo> = self
+            .snap
+            .attachments
+            .iter()
+            .filter(|a| a.item_id == item_id && a.deleted_at.is_none())
+            .map(attachment_info)
+            .collect();
+        out.sort_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)));
+        Ok(out)
+    }
+
+    fn read_attachment(&self, id: &str) -> Result<(AttachmentInfo, Zeroizing<Vec<u8>>)> {
+        let a = self
+            .snap
+            .attachments
+            .iter()
+            .find(|a| a.id == id && a.deleted_at.is_none())
+            .ok_or(Error::NotFound)?;
+        self.item(&a.item_id)?;
+        Ok((attachment_info(a), Zeroizing::new(a.data.clone())))
+    }
+
+    fn rename_attachment(&mut self, ctx: &WriteCtx<'_>, id: &str, file_name: &str) -> Result<()> {
+        let name = sanitize_file_name(file_name)?;
+        self.tx(ctx, |s| {
+            let a = s
+                .attachments
+                .iter_mut()
+                .find(|a| a.id == id && a.deleted_at.is_none())
+                .ok_or(Error::NotFound)?;
+            a.file_name = name;
+            a.updated_at = bump(a.updated_at, ctx.now_ms);
+            a.updated_by = ctx.device_id.to_string();
+            Ok(())
+        })
+    }
+
+    fn delete_attachment(&mut self, ctx: &WriteCtx<'_>, id: &str) -> Result<()> {
+        self.tx(ctx, |s| {
+            let a = s
+                .attachments
+                .iter_mut()
+                .find(|a| a.id == id && a.deleted_at.is_none())
+                .ok_or(Error::NotFound)?;
+            let t = bump(a.updated_at, ctx.now_ms);
+            a.data.zeroize();
+            a.data.clear();
+            a.size = 0;
+            a.sha256 = sha256_hex(&[]);
+            a.deleted_at = Some(t);
+            a.updated_at = t;
+            a.updated_by = ctx.device_id.to_string();
+            Ok(())
+        })
     }
 
     fn snapshot(&self) -> Result<Snapshot> {

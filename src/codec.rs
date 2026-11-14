@@ -3,24 +3,39 @@
 use zeroize::Zeroizing;
 
 use crate::error::{Error, Result};
-use crate::models::{NoteImage, Snapshot};
+use crate::models::Snapshot;
 use crate::side_blob::{is_external, sha256_hex};
 
-/// Current snapshot payload format version.
-pub const SNAPSHOT_FORMAT_VERSION: u8 = 4;
+/// Newest snapshot payload format version this build can read and write.
+pub const SNAPSHOT_FORMAT_VERSION: u8 = 5;
+
+/// Version written when the snapshot has no attachments. Staying on v4 keeps such vaults readable
+/// by builds that predate attachments (ADR 0019).
+const BASE_FORMAT_VERSION: u8 = 4;
 
 /// Result of [`encode_snapshot`].
 pub struct EncodedSnapshot<'a> {
+    /// Format version the payload was written at.
+    pub version: u8,
     /// Serialized payload (plaintext secrets, wiped on drop).
     pub payload: Zeroizing<Vec<u8>>,
-    /// Images that were replaced by references and must be stored as side blobs.
-    pub external: Vec<&'a NoteImage>,
+    /// Blobs (large images, every attachment) that were replaced by references and must be
+    /// stored as side blobs.
+    pub external: Vec<ExternalBlob<'a>>,
+}
+
+/// Bytes that live in a side blob, addressed by their plaintext SHA-256.
+pub struct ExternalBlob<'a> {
+    /// Lowercase hex SHA-256 of `data`.
+    pub sha256: &'a str,
+    /// The bytes to seal.
+    pub data: &'a [u8],
 }
 
 /// Resolver for externalized image bytes: `(sha256_hex, size) -> bytes`.
 pub type ImageResolver<'a> = dyn FnMut(&str, u64) -> Result<Zeroizing<Vec<u8>>> + 'a;
 
-/// Serialize `snapshot` at [`SNAPSHOT_FORMAT_VERSION`] (v2 = the frozen v1 payload followed by
+/// Serialize `snapshot` at v5 if it has attachments, else v4 (v2 = the frozen v1 payload followed by
 /// the category extension: preset keys and category field templates; v3 appends the Trash
 /// extension: the trash time of each trashed item; v4 appends the Vaults extension: each item's
 /// vault and the tombstone time of deleted vaults).
@@ -29,11 +44,16 @@ pub type ImageResolver<'a> = dyn FnMut(&str, u64) -> Result<Zeroizing<Vec<u8>>> 
 /// a mismatch is [`Error::InvalidInput`]. Images above the side-blob threshold are replaced by a
 /// reference and returned in [`EncodedSnapshot::external`].
 pub fn encode_snapshot(snapshot: &Snapshot) -> Result<EncodedSnapshot<'_>> {
-    encode_at(snapshot, SNAPSHOT_FORMAT_VERSION)
+    let version = if snapshot.attachments.is_empty() {
+        BASE_FORMAT_VERSION
+    } else {
+        SNAPSHOT_FORMAT_VERSION
+    };
+    encode_at(snapshot, version)
 }
 
 fn encode_at(snapshot: &Snapshot, version: u8) -> Result<EncodedSnapshot<'_>> {
-    let (wire, external) = v1::Payload::from_snapshot(snapshot)?;
+    let (wire, mut external) = v1::Payload::from_snapshot(snapshot)?;
     let mut bytes = postcard::to_allocvec(&wire).map_err(|_| Error::Corrupted)?;
     if version >= 2 {
         let ext = v2::Ext::from_snapshot(snapshot);
@@ -50,7 +70,14 @@ fn encode_at(snapshot: &Snapshot, version: u8) -> Result<EncodedSnapshot<'_>> {
         let tail = postcard::to_allocvec(&ext).map_err(|_| Error::Corrupted)?;
         bytes.extend_from_slice(&tail);
     }
+    if version >= 5 {
+        let (ext, blobs) = v5::Ext::from_snapshot(snapshot)?;
+        let tail = postcard::to_allocvec(&ext).map_err(|_| Error::Corrupted)?;
+        bytes.extend_from_slice(&tail);
+        external.extend(blobs);
+    }
     Ok(EncodedSnapshot {
+        version,
         payload: Zeroizing::new(bytes),
         external,
     })
@@ -68,7 +95,7 @@ pub fn decode_snapshot(
 ) -> Result<Snapshot> {
     match version {
         1 => v1::decode(bytes, resolve),
-        2..=4 => {
+        2..=5 => {
             let (mut snap, rest) = v1::decode_prefix(bytes, resolve)?;
             let (ext, rest) =
                 postcard::take_from_bytes::<v2::Ext>(rest).map_err(|_| Error::Corrupted)?;
@@ -89,6 +116,14 @@ pub fn decode_snapshot(
             } else {
                 rest
             };
+            let rest = if version >= 5 {
+                let (att, rest) =
+                    postcard::take_from_bytes::<v5::Ext>(rest).map_err(|_| Error::Corrupted)?;
+                att.apply(&mut snap, resolve)?;
+                rest
+            } else {
+                rest
+            };
             if !rest.is_empty() {
                 return Err(Error::Corrupted);
             }
@@ -104,13 +139,29 @@ pub fn external_image_refs(version: u8, bytes: &[u8]) -> Result<Vec<(String, u64
     match version {
         1 => v1::external_refs(bytes),
         2..=4 => v1::external_refs_prefix(bytes),
+        5 => {
+            let (mut refs, rest) = v1::external_refs_split(bytes)?;
+            let (_, rest) =
+                postcard::take_from_bytes::<v2::Ext>(rest).map_err(|_| Error::Corrupted)?;
+            let (_, rest) =
+                postcard::take_from_bytes::<v3::Ext>(rest).map_err(|_| Error::Corrupted)?;
+            let (_, rest) =
+                postcard::take_from_bytes::<v4::Ext>(rest).map_err(|_| Error::Corrupted)?;
+            let (att, rest) =
+                postcard::take_from_bytes::<v5::Ext>(rest).map_err(|_| Error::Corrupted)?;
+            if !rest.is_empty() {
+                return Err(Error::Corrupted);
+            }
+            refs.extend(att.external_refs());
+            Ok(refs)
+        }
         _ => Err(Error::UnsupportedVersion),
     }
 }
 
 /// Whether this build can decode `version`.
 pub fn is_supported_version(version: u8) -> bool {
-    matches!(version, 1..=4)
+    matches!(version, 1..=5)
 }
 
 /// Wire format v1. **Frozen**: postcard is not self-describing, so any change to these types
@@ -266,7 +317,7 @@ mod v1 {
         data: Option<Vec<u8>>,
     }
 
-    fn hash_bytes(hex: &str) -> Result<[u8; 32]> {
+    pub(super) fn hash_bytes(hex: &str) -> Result<[u8; 32]> {
         HEXLOWER
             .decode(hex.as_bytes())
             .map_err(|_| Error::InvalidInput)?
@@ -275,7 +326,7 @@ mod v1 {
     }
 
     impl Payload {
-        pub fn from_snapshot(s: &Snapshot) -> Result<(Self, Vec<&NoteImage>)> {
+        pub fn from_snapshot(s: &Snapshot) -> Result<(Self, Vec<super::ExternalBlob<'_>>)> {
             let mut external = Vec::new();
             let mut images = Vec::with_capacity(s.note_images.len());
             for i in &s.note_images {
@@ -283,7 +334,10 @@ mod v1 {
                     return Err(Error::InvalidInput);
                 }
                 let data = if is_external(i.data.len()) {
-                    external.push(i);
+                    external.push(super::ExternalBlob {
+                        sha256: i.sha256.as_str(),
+                        data: i.data.as_slice(),
+                    });
                     None
                 } else {
                     Some(i.data.clone())
@@ -563,9 +617,9 @@ mod v1 {
         external_refs_split(bytes).map(|(refs, _)| refs)
     }
 
-    type ExternalRefs = Vec<(String, u64)>;
+    pub(super) type ExternalRefs = Vec<(String, u64)>;
 
-    fn external_refs_split(bytes: &[u8]) -> Result<(ExternalRefs, &[u8])> {
+    pub(super) fn external_refs_split(bytes: &[u8]) -> Result<(ExternalRefs, &[u8])> {
         let (wire, rest) =
             postcard::take_from_bytes::<Payload>(bytes).map_err(|_| Error::Corrupted)?;
         let refs = wire
@@ -732,6 +786,127 @@ mod v3 {
                     .find(|i| i.id == t.item_id)
                     .ok_or(Error::Corrupted)?;
                 item.trashed_at = Some(t.trashed_at);
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Wire format v5 extension (appended after v4): file attachments (ADR 0019). Bytes are never
+/// inline; every live attachment is a side blob addressed by `sha256`. Tombstoned attachments carry
+/// no blob (`size == 0`). Written only when the vault has attachment rows, so vaults without them
+/// stay at v4.
+mod v5 {
+    use data_encoding::HEXLOWER;
+    use serde::{Deserialize, Serialize};
+    use zeroize::Zeroize;
+
+    use super::v1::hash_bytes;
+    use super::{ExternalBlob, ImageResolver};
+    use crate::error::{Error, Result};
+    use crate::models::{Attachment, Snapshot};
+    use crate::side_blob::sha256_hex;
+
+    #[derive(Serialize, Deserialize, Zeroize)]
+    #[zeroize(drop)]
+    pub(super) struct AttachmentW {
+        id: String,
+        item_id: String,
+        file_name: String,
+        mime_type: String,
+        sha256: [u8; 32],
+        size: u64,
+        created_at: i64,
+        updated_at: i64,
+        updated_by: String,
+        deleted_at: Option<i64>,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    pub struct Ext {
+        attachments: Vec<AttachmentW>,
+    }
+
+    impl Ext {
+        pub fn from_snapshot(s: &Snapshot) -> Result<(Self, Vec<ExternalBlob<'_>>)> {
+            let mut blobs = Vec::new();
+            let mut attachments = Vec::with_capacity(s.attachments.len());
+            for a in &s.attachments {
+                // Never trust declared hash/size: derive from the bytes (ADR 0001).
+                if a.size != a.data.len() as u64 || a.sha256 != sha256_hex(&a.data) {
+                    return Err(Error::InvalidInput);
+                }
+                if a.deleted_at.is_none() {
+                    if a.data.is_empty() {
+                        return Err(Error::InvalidInput);
+                    }
+                    blobs.push(ExternalBlob {
+                        sha256: a.sha256.as_str(),
+                        data: a.data.as_slice(),
+                    });
+                } else if !a.data.is_empty() {
+                    // A tombstone must have been scrubbed.
+                    return Err(Error::InvalidInput);
+                }
+                attachments.push(AttachmentW {
+                    id: a.id.clone(),
+                    item_id: a.item_id.clone(),
+                    file_name: a.file_name.clone(),
+                    mime_type: a.mime_type.clone(),
+                    sha256: hash_bytes(&a.sha256)?,
+                    size: a.size,
+                    created_at: a.created_at,
+                    updated_at: a.updated_at,
+                    updated_by: a.updated_by.clone(),
+                    deleted_at: a.deleted_at,
+                });
+            }
+            Ok((Self { attachments }, blobs))
+        }
+
+        /// `(sha256_hex, size)` of every blob this extension refers to.
+        pub fn external_refs(&self) -> Vec<(String, u64)> {
+            self.attachments
+                .iter()
+                .filter(|a| a.deleted_at.is_none())
+                .map(|a| (HEXLOWER.encode(&a.sha256), a.size))
+                .collect()
+        }
+
+        pub fn apply(mut self, snap: &mut Snapshot, resolve: &mut ImageResolver<'_>) -> Result<()> {
+            for w in &mut self.attachments {
+                // A reference to an unknown item means the payload is damaged.
+                if !snap.items.iter().any(|i| i.id == w.item_id) {
+                    return Err(Error::Corrupted);
+                }
+                let hex = HEXLOWER.encode(&w.sha256);
+                let data = if w.deleted_at.is_none() {
+                    let bytes = resolve(&hex, w.size)?;
+                    if bytes.is_empty() || bytes.len() as u64 != w.size || sha256_hex(&bytes) != hex
+                    {
+                        return Err(Error::Corrupted);
+                    }
+                    let mut bytes = bytes;
+                    std::mem::take(&mut *bytes)
+                } else {
+                    if w.size != 0 {
+                        return Err(Error::Corrupted);
+                    }
+                    Vec::new()
+                };
+                snap.attachments.push(Attachment {
+                    id: std::mem::take(&mut w.id),
+                    item_id: std::mem::take(&mut w.item_id),
+                    file_name: std::mem::take(&mut w.file_name),
+                    mime_type: std::mem::take(&mut w.mime_type),
+                    sha256: sha256_hex(&data),
+                    size: data.len() as u64,
+                    data,
+                    created_at: w.created_at,
+                    updated_at: w.updated_at,
+                    updated_by: std::mem::take(&mut w.updated_by),
+                    deleted_at: w.deleted_at,
+                });
             }
             Ok(())
         }
@@ -919,6 +1094,7 @@ pub(crate) mod fixtures {
                 deleted_at: None,
             }],
             note_images: images,
+            attachments: Vec::new(),
         }
     }
 }
@@ -1002,6 +1178,7 @@ mod v4 {
 mod tests {
     use super::fixtures::*;
     use super::*;
+    use crate::models::Attachment;
     use crate::side_blob::sha256_hex;
     use std::collections::HashMap;
 
@@ -1014,9 +1191,9 @@ mod tests {
         let store: HashMap<String, Vec<u8>> = enc
             .external
             .iter()
-            .map(|i| (i.sha256.clone(), i.data.clone()))
+            .map(|i| (i.sha256.to_string(), i.data.to_vec()))
             .collect();
-        decode_snapshot(SNAPSHOT_FORMAT_VERSION, &enc.payload, &mut |h, _| {
+        decode_snapshot(enc.version, &enc.payload, &mut |h, _| {
             store
                 .get(h)
                 .cloned()
@@ -1061,8 +1238,8 @@ mod tests {
     fn small_images_stay_inline_and_large_ones_are_externalized() {
         let s = sample(true);
         let enc = encode_snapshot(&s).unwrap();
-        let ids: Vec<_> = enc.external.iter().map(|i| i.id.as_str()).collect();
-        assert_eq!(ids, ["img-big"]);
+        let hashes: Vec<_> = enc.external.iter().map(|i| i.sha256).collect();
+        assert_eq!(hashes, [sha256_hex(&pattern(65_537))]);
         // The big image bytes must not be inside the payload; the snapshot stays light.
         let big = pattern(65_537);
         assert!(
@@ -1117,7 +1294,7 @@ mod tests {
     fn unknown_versions_are_rejected_before_parsing() {
         let snap = sample(false);
         let enc = encode_snapshot(&snap).unwrap();
-        for v in [0u8, 5, 255] {
+        for v in [0u8, 6, 255] {
             let r = decode_snapshot(v, &enc.payload, &mut no_resolver());
             assert_eq!(r.err(), Some(Error::UnsupportedVersion), "v{v}");
         }
@@ -1195,6 +1372,41 @@ mod tests {
         s
     }
 
+    const GOLDEN_V5: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/snapshot_v5.postcard"
+    );
+
+    fn attachment(id: &str, item: &str, data: Vec<u8>, deleted_at: Option<i64>) -> Attachment {
+        Attachment {
+            id: id.into(),
+            item_id: item.into(),
+            file_name: "scan.pdf".into(),
+            mime_type: "application/pdf".into(),
+            sha256: sha256_hex(&data),
+            size: data.len() as u64,
+            data,
+            created_at: 1_700_000_010_000,
+            updated_at: 1_700_000_011_000,
+            updated_by: "dev-a".into(),
+            deleted_at,
+        }
+    }
+
+    /// The v4 sample plus one live attachment and one tombstoned one (what the v5 golden file pins).
+    fn attached_sample(big: bool) -> Snapshot {
+        let mut s = vaulted_sample(big);
+        s.attachments
+            .push(attachment("att-1", "item-1", pattern(1_000), None));
+        s.attachments.push(attachment(
+            "att-2",
+            "item-1",
+            Vec::new(),
+            Some(1_700_000_012_000),
+        ));
+        s
+    }
+
     /// Regenerate with `TV_REGEN_GOLDEN=1 cargo test -p vault-core regenerate_snapshot_golden -- --ignored`.
     /// Only do that when intentionally adding a new format version. (v1 and v2 are frozen: never
     /// regenerate them; only the current version's file may be written.)
@@ -1204,9 +1416,10 @@ mod tests {
         if std::env::var("TV_REGEN_GOLDEN").is_err() {
             return;
         }
-        let snap = vaulted_sample(true);
+        let snap = attached_sample(true);
         let enc = encode_snapshot(&snap).unwrap();
-        std::fs::write(GOLDEN_V4, &*enc.payload).unwrap();
+        assert_eq!(enc.version, 5);
+        std::fs::write(GOLDEN_V5, &*enc.payload).unwrap();
     }
 
     fn big_resolver(h: &str, size: u64) -> Result<Zeroizing<Vec<u8>>> {
@@ -1270,6 +1483,99 @@ mod tests {
         let bytes = std::fs::read(GOLDEN_V4).unwrap();
         let snap = vaulted_sample(true);
         assert_eq!(*encode_snapshot(&snap).unwrap().payload, bytes);
+    }
+
+    fn attach_resolver(h: &str, size: u64) -> Result<Zeroizing<Vec<u8>>> {
+        if h == sha256_hex(&pattern(1_000)) {
+            assert_eq!(size, 1_000);
+            Ok(Zeroizing::new(pattern(1_000)))
+        } else {
+            big_resolver(h, size)
+        }
+    }
+
+    #[test]
+    fn golden_v5_blob_decodes_to_the_expected_snapshot() {
+        let bytes = std::fs::read(GOLDEN_V5).unwrap();
+        let out = decode_snapshot(5, &bytes, &mut attach_resolver).unwrap();
+        assert_eq!(out, attached_sample(true));
+    }
+
+    #[test]
+    fn current_encoder_still_produces_the_golden_v5_bytes() {
+        let bytes = std::fs::read(GOLDEN_V5).unwrap();
+        let snap = attached_sample(true);
+        let enc = encode_snapshot(&snap).unwrap();
+        assert_eq!(enc.version, 5);
+        assert_eq!(*enc.payload, bytes);
+    }
+
+    #[test]
+    fn vaults_without_attachments_stay_at_v4_and_attachments_bump_to_v5() {
+        assert_eq!(encode_snapshot(&vaulted_sample(false)).unwrap().version, 4);
+        assert_eq!(encode_snapshot(&attached_sample(false)).unwrap().version, 5);
+    }
+
+    #[test]
+    fn attachments_are_always_side_blobs_and_round_trip() {
+        let s = attached_sample(false);
+        let enc = encode_snapshot(&s).unwrap();
+        let hashes: Vec<_> = enc.external.iter().map(|b| b.sha256).collect();
+        assert_eq!(hashes, [sha256_hex(&pattern(1_000))]);
+        let probe = pattern(1_000);
+        assert!(!enc.payload.windows(64).any(|w| w == &probe[..64]));
+        assert_eq!(round_trip(&s), s);
+        let refs = external_image_refs(5, &enc.payload).unwrap();
+        assert_eq!(refs, [(sha256_hex(&pattern(1_000)), 1_000)]);
+    }
+
+    #[test]
+    fn encode_rejects_inconsistent_attachments() {
+        let mut s = attached_sample(false);
+        s.attachments[0].sha256 = sha256_hex(b"other");
+        assert_eq!(encode_snapshot(&s).err(), Some(Error::InvalidInput));
+        let mut s = attached_sample(false);
+        s.attachments[0].size += 1;
+        assert_eq!(encode_snapshot(&s).err(), Some(Error::InvalidInput));
+        // A live attachment without bytes and a tombstone that still holds bytes are both invalid.
+        let mut s = attached_sample(false);
+        s.attachments[0] = attachment("att-1", "item-1", Vec::new(), None);
+        assert_eq!(encode_snapshot(&s).err(), Some(Error::InvalidInput));
+        let mut s = attached_sample(false);
+        s.attachments[1] = attachment("att-2", "item-1", pattern(10), Some(1));
+        assert_eq!(encode_snapshot(&s).err(), Some(Error::InvalidInput));
+    }
+
+    #[test]
+    fn decode_rejects_attachment_bytes_that_do_not_match_or_are_missing() {
+        let snap = attached_sample(false);
+        let enc = encode_snapshot(&snap).unwrap();
+        let wrong = decode_snapshot(5, &enc.payload, &mut |_, _| {
+            Ok(Zeroizing::new(vec![1, 2, 3]))
+        });
+        assert_eq!(wrong.err(), Some(Error::Corrupted));
+        let missing = decode_snapshot(5, &enc.payload, &mut no_resolver());
+        assert_eq!(missing.err(), Some(Error::NotFound));
+    }
+
+    #[test]
+    fn decode_rejects_an_attachment_of_an_unknown_item() {
+        let mut s = attached_sample(false);
+        s.attachments[0].item_id = "ghost".into();
+        let enc = encode_snapshot(&s).unwrap();
+        let r = decode_snapshot(5, &enc.payload, &mut attach_resolver);
+        assert_eq!(r.err(), Some(Error::Corrupted));
+    }
+
+    #[test]
+    fn truncated_v5_payloads_are_corrupted_never_a_panic() {
+        let snap = attached_sample(false);
+        let enc = encode_snapshot(&snap).unwrap();
+        for cut in [1usize, 5, 40] {
+            let short = &enc.payload[..enc.payload.len() - cut];
+            let r = decode_snapshot(5, short, &mut attach_resolver);
+            assert!(r.is_err(), "cut {cut}");
+        }
     }
 
     #[test]

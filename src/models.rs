@@ -503,6 +503,61 @@ impl Drop for NoteImage {
     }
 }
 
+/// Largest accepted attachment, in bytes (ADR 0019).
+pub const MAX_ATTACHMENT_BYTES: usize = 10 * 1024 * 1024;
+/// Largest total of live attachment bytes in one vault (ADR 0019).
+pub const MAX_VAULT_ATTACHMENT_BYTES: u64 = 200 * 1024 * 1024;
+
+/// A file attached to an item (ADR 0019). Metadata merges last-writer-wins like any record; the
+/// bytes are immutable per `sha256` and travel as side blobs. `data` is empty once tombstoned.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Attachment {
+    /// Attachment id.
+    pub id: String,
+    /// Owning item.
+    pub item_id: String,
+    /// Sanitized file name.
+    pub file_name: String,
+    /// MIME type as declared by the caller (never trusted to pick behavior).
+    pub mime_type: String,
+    /// Lowercase hex SHA-256 of `data`.
+    pub sha256: String,
+    /// Length of `data` in bytes.
+    pub size: u64,
+    /// File bytes. Blank once tombstoned.
+    pub data: Vec<u8>,
+    /// Creation time, Unix ms UTC.
+    pub created_at: i64,
+    /// Last modification time, Unix ms UTC.
+    pub updated_at: i64,
+    /// Device id of the last writer.
+    pub updated_by: String,
+    /// Tombstone time.
+    pub deleted_at: Option<i64>,
+}
+
+impl fmt::Debug for Attachment {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Neither the name nor the bytes are printed.
+        f.debug_struct("Attachment")
+            .field("id", &self.id)
+            .field("item_id", &self.item_id)
+            .field("file_name", &REDACTED)
+            .field("size", &self.size)
+            .field("data", &REDACTED)
+            .field("updated_at", &self.updated_at)
+            .field("deleted_at", &self.deleted_at)
+            .finish()
+    }
+}
+
+impl Drop for Attachment {
+    fn drop(&mut self) {
+        self.data.zeroize();
+        self.file_name.zeroize();
+    }
+}
+
 /// Id of the vault every account starts with (and that pre-vault data belongs to). Fixed so that
 /// devices migrating independently create the *same* record instead of duplicates.
 pub const DEFAULT_VAULT_ID: &str = "default";
@@ -550,4 +605,6 @@ pub struct Snapshot {
     pub note_blocks: Vec<NoteBlock>,
     /// Note images.
     pub note_images: Vec<NoteImage>,
+    /// File attachments (ADR 0019).
+    pub attachments: Vec<Attachment>,
 }

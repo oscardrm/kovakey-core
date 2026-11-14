@@ -799,6 +799,65 @@ mod tests {
     }
 
     #[test]
+    fn attachments_travel_as_encrypted_side_blobs_between_devices() {
+        let (mut a, _) = new_mem();
+        let mail = add_login(&mut a, 10, "Mail", "fake-secret");
+        let file = b"%PDF-1.7 fake attachment bytes".to_vec();
+        let att = a
+            .write(11, |st, ctx| {
+                st.add_attachment(ctx, &mail, "scan.pdf", "application/pdf", &file)
+            })
+            .unwrap();
+        let sealed = a.export_vault().unwrap();
+        // The provider-visible pieces never contain the bytes or the name.
+        assert_eq!(sealed.side_blobs.len(), 1);
+        for piece in [&sealed.file, &sealed.side_blobs[0].sealed] {
+            assert!(!piece.windows(file.len()).any(|w| w == &file[..]));
+            assert!(!piece.windows(8).any(|w| w == b"scan.pdf"));
+        }
+        assert_eq!(
+            a.required_side_blobs(&sealed.file).unwrap(),
+            [sealed.side_blobs[0].name.clone()]
+        );
+
+        // Missing blob is reported, not silently dropped.
+        let none = Session::<Database>::from_vault_file(
+            &sealed.file,
+            UnlockSecret::Password(PW),
+            "dev-b",
+            &|_| None,
+            |k| Database::open_in_memory(&k.db_key()?),
+        );
+        assert_eq!(none.err(), Some(Error::NotFound));
+
+        // Device B (SQLCipher) restores the attachment from the file plus the blob.
+        let mut b = Session::<Database>::from_vault_file(
+            &sealed.file,
+            UnlockSecret::Password(PW),
+            "dev-b",
+            &|n| blobs(&sealed).get(n).cloned(),
+            |k| Database::open_in_memory(&k.db_key()?),
+        )
+        .unwrap();
+        let (info, bytes) = b.store().unwrap().read_attachment(&att).unwrap();
+        assert_eq!(info.file_name, "scan.pdf");
+        assert_eq!(bytes.as_slice(), &file[..]);
+
+        // Deleting on B propagates a tombstone (no blob) back to A.
+        b.write(20, |st, ctx| st.delete_attachment(ctx, &att))
+            .unwrap();
+        let back = b.export_vault().unwrap();
+        assert!(back.side_blobs.is_empty());
+        a.merge_remote_vault(&back.file, &|_| None).unwrap();
+        assert!(a
+            .store()
+            .unwrap()
+            .list_attachments(&mail)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
     fn two_devices_converge_through_exported_vault_files_across_backends() {
         let (mut a, _) = new_mem();
         let mail = add_login(&mut a, 10, "Mail", "fake-secret");

@@ -16,7 +16,7 @@ use std::collections::HashSet;
 
 use zeroize::Zeroizing;
 
-use crate::codec::{self, SNAPSHOT_FORMAT_VERSION};
+use crate::codec;
 use crate::crypto;
 use crate::error::{Error, Result};
 use crate::keys::{VaultHeader, VaultKeys, HEADER_LEN};
@@ -60,18 +60,18 @@ pub fn seal_vault(
     let sealed = crypto::seal(
         &key,
         &encoded.payload,
-        &payload_aad(&header_bytes, SNAPSHOT_FORMAT_VERSION),
+        &payload_aad(&header_bytes, encoded.version),
     )?;
-    let file = [&header_bytes[..], &[SNAPSHOT_FORMAT_VERSION], &sealed].concat();
+    let file = [&header_bytes[..], &[encoded.version], &sealed].concat();
 
     let mut seen = HashSet::new();
     let mut side_blobs = Vec::new();
-    for img in &encoded.external {
-        if seen.insert(img.sha256.as_str()) {
+    for blob in &encoded.external {
+        if seen.insert(blob.sha256) {
             side_blobs.push(side_blob::seal_side_blob(
                 keys,
                 header.vault_id(),
-                &img.data,
+                blob.data,
             )?);
         }
     }
@@ -294,7 +294,7 @@ mod tests {
     fn unknown_snapshot_version_is_unsupported() {
         let (h, k) = vault();
         let mut f = seal_vault(&h, &k, &sample(false)).unwrap().file;
-        f[HEADER_LEN] = 5;
+        f[HEADER_LEN] = 6;
         assert_eq!(
             open(&f, &k, &HashMap::new()).unwrap_err(),
             Error::UnsupportedVersion
