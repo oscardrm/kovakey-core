@@ -300,6 +300,40 @@ impl<S: VaultStore> Session<S> {
         Ok(out)
     }
 
+    /// `(item_id, hibp_prefix)` for every live item's primary password, for the opt-in HIBP check
+    /// (ADR 0017). Only the 5-char SHA-1 prefix is returned; passwords stay inside the core.
+    pub fn breach_prefixes(&self) -> Result<Vec<(String, String)>> {
+        let store = self.store()?;
+        let mut out = Vec::new();
+        for summary in store.list_items()? {
+            let detail = store.get_item(&summary.id)?;
+            let Some(field) = detail.fields.iter().find(|f| f.kind == "password") else {
+                continue;
+            };
+            let pw = store.reveal_field(&summary.id, &field.id)?;
+            if pw.is_empty() {
+                continue;
+            }
+            out.push((summary.id, crate::breach::prefix(&pw)?));
+        }
+        Ok(out)
+    }
+
+    /// Breach count of the item's primary password in a HIBP range response body (`0` if absent
+    /// or the item has no password). The caller fetched the body for this item's prefix.
+    pub fn breach_match(&self, item_id: &str, response_body: &str) -> Result<u64> {
+        let store = self.store()?;
+        let detail = store.get_item(item_id)?;
+        let Some(field) = detail.fields.iter().find(|f| f.kind == "password") else {
+            return Ok(0);
+        };
+        let pw = store.reveal_field(item_id, &field.id)?;
+        if pw.is_empty() {
+            return Ok(0);
+        }
+        crate::breach::match_count(&pw, response_body)
+    }
+
     /// Local Security Audit: weak, reused, old and missing-2FA items, computed in memory with no
     /// network access. `old_after_days` is the age threshold for `old`; `now_ms` is Unix ms UTC.
     pub fn security_audit(&self, now_ms: i64, old_after_days: u32) -> Result<AuditReport> {
@@ -893,6 +927,18 @@ mod tests {
         assert!(get(&b).reused && get(&c).reused);
         assert_eq!(get(&b).level, crate::generator::Strength::Strong);
         assert!(r.iter().all(|p| p.key.is_empty()));
+    }
+
+    #[test]
+    fn breach_prefixes_and_match_keep_passwords_in_core() {
+        let (mut s, _) = new_mem();
+        let a = add_login(&mut s, 10, "A", "password");
+        let _ = add_login(&mut s, 20, "B", "");
+        let p = s.breach_prefixes().unwrap();
+        assert_eq!(p, vec![(a.clone(), "5BAA6".to_string())]);
+        let body = "1E4C9B93F3F0682250B6CF8331B7EE68FD8:77\r\n";
+        assert_eq!(s.breach_match(&a, body).unwrap(), 77);
+        assert_eq!(s.breach_match(&a, "ABC:1").unwrap(), 0);
     }
 
     #[test]

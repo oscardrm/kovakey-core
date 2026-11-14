@@ -5,6 +5,7 @@
     allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)
 )]
 
+pub mod breach;
 pub mod codec;
 pub mod crypto;
 #[cfg(feature = "sqlcipher")]
