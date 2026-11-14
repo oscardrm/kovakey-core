@@ -394,6 +394,36 @@ impl<S: VaultStore> Session<S> {
         vault_file::seal_vault(&self.header, &st.keys, &st.store.snapshot()?)
     }
 
+    /// Encrypted KovaKey export sealed under `export_password` (ADR 0016). The password is chosen
+    /// for the file and need not match the Master Password.
+    pub fn export_encrypted(&self, export_password: &str) -> Result<Vec<u8>> {
+        let st = self.state.as_ref().ok_or(Error::Locked)?;
+        crate::export::export_encrypted(&st.store, export_password)
+    }
+
+    /// Plaintext JSON export. Re-verifies the Master Password (skipped after a Recovery Key
+    /// unlock, like [`Session::change_password`]) so an unattended unlocked session cannot dump
+    /// the vault. The UI must also show the plaintext warning and get confirmation.
+    pub fn export_plain_json(&self, current_password: &str) -> Result<Zeroizing<Vec<u8>>> {
+        let st = self.verified_state(current_password)?;
+        crate::export::export_plain_json(&st.store)
+    }
+
+    /// Plaintext CSV export; same re-verification and warning rules as
+    /// [`Session::export_plain_json`].
+    pub fn export_plain_csv(&self, current_password: &str) -> Result<Zeroizing<Vec<u8>>> {
+        let st = self.verified_state(current_password)?;
+        crate::export::export_plain_csv(&st.store)
+    }
+
+    fn verified_state(&self, current_password: &str) -> Result<&Unlocked<S>> {
+        let st = self.state.as_ref().ok_or(Error::Locked)?;
+        if !self.via_recovery {
+            self.header.unlock(current_password.as_bytes())?;
+        }
+        Ok(st)
+    }
+
     /// Side-blob storage names a downloaded `.vault` file needs. Fetch those, then call
     /// [`Session::merge_remote_vault`].
     pub fn required_side_blobs(&self, file: &[u8]) -> Result<Vec<String>> {
@@ -580,6 +610,23 @@ mod tests {
             })
             .unwrap();
         assert!(s.enroll_device_unlock("").is_ok());
+    }
+
+    #[test]
+    fn plain_exports_require_the_master_password_and_locked_sessions_export_nothing() {
+        let (mut s, _) = new_mem();
+        add_login(&mut s, 10, "Mail", "fake-secret");
+        assert_eq!(s.export_plain_json("wrong").err(), Some(Error::Decryption));
+        assert_eq!(s.export_plain_csv("wrong").err(), Some(Error::Decryption));
+        let json = s.export_plain_json(PW).unwrap();
+        assert!(String::from_utf8_lossy(&json).contains("fake-secret"));
+        assert!(s.export_plain_csv(PW).is_ok());
+        // The encrypted export does not need the Master Password and hides the secret.
+        let enc = s.export_encrypted("fake-export-pass").unwrap();
+        assert!(!enc.windows(11).any(|w| w == b"fake-secret"));
+        s.lock();
+        assert_eq!(s.export_plain_json(PW).err(), Some(Error::Locked));
+        assert_eq!(s.export_encrypted("x").err(), Some(Error::Locked));
     }
 
     #[test]

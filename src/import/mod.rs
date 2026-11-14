@@ -5,6 +5,7 @@
 //! holding imported secrets redacts its `Debug` output and is wiped on drop.
 
 pub mod enpass;
+pub mod kovakey;
 
 use std::collections::HashSet;
 use std::fmt;
