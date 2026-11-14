@@ -33,7 +33,7 @@ serde = { version = "1", default-features = false, features = ["derive", "alloc"
 postcard = { version = "1", default-features = false, features = ["alloc"] }
 # Import parsing (ADR 0005): JSON only, no_std-friendly, wasm-safe.
 serde_json = { version = "1", default-features = false, features = ["alloc"] }
-rusqlite = { version = "0.32", features = ["bundled-sqlcipher-vendored-openssl"], optional = true }
+rusqlite = { version = "0.42.0", features = ["bundled-sqlcipher-vendored-openssl"], optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom = { version = "0.2", features = ["js"] }
