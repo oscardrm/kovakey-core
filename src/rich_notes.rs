@@ -63,56 +63,72 @@ fn plain(text: &str) -> MdSpan {
     }
 }
 
-/// If `rest` (just after an opening delimiter) holds a non-empty run closed by `close`, returns
-/// `(inner, after_close)`.
-fn take_until<'a>(rest: &'a str, close: &str) -> Option<(&'a str, &'a str)> {
+/// Returns the non-empty run of `rest` (just after an opening delimiter) closed by `close`.
+fn take_until<'a>(rest: &'a str, close: &str) -> Option<&'a str> {
     let end = rest.find(close)?;
     if end == 0 {
         return None;
     }
-    Some((&rest[..end], &rest[end + close.len()..]))
+    rest.get(..end)
 }
 
-fn flush(buf: &mut String, bold: bool, italic: bool, out: &mut Vec<MdSpan>) {
-    if !buf.is_empty() {
-        out.push(MdSpan {
-            text: core::mem::take(buf),
-            bold,
-            italic,
-            code: false,
+/// A styled stretch of one line, as byte offsets into that line. `marker` runs are syntax (`**`, `#`,
+/// `- `, indentation) and carry no visible text in the rendered note.
+struct Run {
+    start: usize,
+    len: usize,
+    bold: bool,
+    italic: bool,
+    code: bool,
+    marker: bool,
+}
+
+fn push_run(out: &mut Vec<Run>, start: usize, len: usize, style: (bool, bool, bool), marker: bool) {
+    if len > 0 {
+        out.push(Run {
+            start,
+            len,
+            bold: style.0,
+            italic: style.1,
+            code: style.2,
+            marker,
         });
     }
 }
 
-fn inline(s: &str, bold: bool, italic: bool, out: &mut Vec<MdSpan>) {
-    let mut buf = String::new();
-    let mut rest = s;
+/// Tokenizes inline styles of `s` (which starts at byte `base` of its line). Runs cover `s` fully.
+fn inline(s: &str, base: usize, bold: bool, italic: bool, out: &mut Vec<Run>) {
+    let mut plain_start = 0usize;
+    let mut i = 0usize;
     let mut prev: Option<char> = None;
-    while let Some(c) = rest.chars().next() {
-        let after_c = &rest[c.len_utf8()..];
+    while let Some(rest) = s.get(i..).filter(|r| !r.is_empty()) {
+        let Some(c) = rest.chars().next() else { break };
+        let after_c = rest.get(c.len_utf8()..).unwrap_or_default();
+        let style = (bold, italic, false);
         if rest.starts_with("**") {
-            if let Some((inner, after)) = take_until(&rest[2..], "**") {
-                flush(&mut buf, bold, italic, out);
-                inline(inner, true, italic, out);
-                rest = after;
+            let body = rest.get(2..).unwrap_or_default();
+            if let Some(inner) = take_until(body, "**") {
+                push_run(out, base + plain_start, i - plain_start, style, false);
+                push_run(out, base + i, 2, style, true);
+                inline(inner, base + i + 2, true, italic, out);
+                push_run(out, base + i + 2 + inner.len(), 2, style, true);
+                i += 4 + inner.len();
+                plain_start = i;
                 prev = Some('*');
                 continue;
             }
             // Unclosed `**`: keep both markers literal so the second cannot open an italic run.
-            buf.push_str("**");
-            rest = rest.get(2..).unwrap_or_default();
+            i += 2;
             prev = Some('*');
             continue;
         } else if c == '`' {
-            if let Some((inner, after)) = take_until(after_c, "`") {
-                flush(&mut buf, bold, italic, out);
-                out.push(MdSpan {
-                    text: inner.to_string(),
-                    bold,
-                    italic,
-                    code: true,
-                });
-                rest = after;
+            if let Some(inner) = take_until(after_c, "`") {
+                push_run(out, base + plain_start, i - plain_start, style, false);
+                push_run(out, base + i, 1, style, true);
+                push_run(out, base + i + 1, inner.len(), (bold, italic, true), false);
+                push_run(out, base + i + 1 + inner.len(), 1, style, true);
+                i += 2 + inner.len();
+                plain_start = i;
                 prev = Some('`');
                 continue;
             }
@@ -122,45 +138,73 @@ fn inline(s: &str, bold: bool, italic: bool, out: &mut Vec<MdSpan>) {
             let tight = |inner: &str| {
                 !inner.starts_with(char::is_whitespace) && !inner.ends_with(char::is_whitespace)
             };
-            if let Some((inner, after)) = take_until(after_c, delim).filter(|(i, _)| tight(i)) {
-                flush(&mut buf, bold, italic, out);
-                inline(inner, bold, true, out);
-                rest = after;
+            if let Some(inner) = take_until(after_c, delim).filter(|inner| tight(inner)) {
+                push_run(out, base + plain_start, i - plain_start, style, false);
+                push_run(out, base + i, 1, style, true);
+                inline(inner, base + i + 1, bold, true, out);
+                push_run(out, base + i + 1 + inner.len(), 1, style, true);
+                i += 2 + inner.len();
+                plain_start = i;
                 prev = Some(c);
                 continue;
             }
         }
-        buf.push(c);
+        i += c.len_utf8();
         prev = Some(c);
-        rest = after_c;
     }
-    flush(&mut buf, bold, italic, out);
+    push_run(
+        out,
+        base + plain_start,
+        s.len() - plain_start,
+        (bold, italic, false),
+        false,
+    );
 }
 
-fn parse_line(line: &str) -> Option<MdBlock> {
-    let t = line.trim();
-    if t.is_empty() {
-        return None;
-    }
+struct Line {
+    kind: MdBlockKind,
+    level: u32,
+    runs: Vec<Run>,
+}
+
+/// Number of leading bytes of `s` that are spaces or tabs.
+fn blank_prefix(s: &str) -> usize {
+    s.len() - s.trim_start_matches([' ', '\t']).len()
+}
+
+/// Splits a line into its block kind and styled runs (covering the whole line).
+fn tokenize_line(line: &str) -> Line {
+    let lead = blank_prefix(line);
+    let t = line.get(lead..).unwrap_or_default();
+    let mut runs = Vec::new();
+    push_run(&mut runs, 0, lead, (false, false, false), true);
+
     let hashes = t.chars().take_while(|&c| c == '#').count();
-    let (kind, level, body) = if (1..=6).contains(&hashes) && t[hashes..].starts_with(' ') {
-        (MdBlockKind::Heading, hashes as u32, t[hashes..].trim())
-    } else if let Some(b) = t.strip_prefix("- ").or_else(|| t.strip_prefix("* ")) {
-        (MdBlockKind::Bullet, 0, b.trim())
+    let after_hashes = t.get(hashes..).unwrap_or_default();
+    let (kind, level, marker_len) = if (1..=6).contains(&hashes) && after_hashes.starts_with(' ') {
+        (MdBlockKind::Heading, hashes as u32, hashes)
+    } else if t.starts_with("- ") || t.starts_with("* ") {
+        (MdBlockKind::Bullet, 0, 1)
     } else {
         let digits = t.chars().take_while(char::is_ascii_digit).count();
-        match t[digits..].strip_prefix(". ") {
-            Some(b) if (1..=9).contains(&digits) => (
+        match t.get(digits..).and_then(|r| r.strip_prefix(". ")) {
+            Some(_) if (1..=9).contains(&digits) => (
                 MdBlockKind::Numbered,
-                t[..digits].parse().unwrap_or(1),
-                b.trim(),
+                t.get(..digits).and_then(|d| d.parse().ok()).unwrap_or(1),
+                digits + 1,
             ),
-            _ => (MdBlockKind::Paragraph, 0, t),
+            _ => (MdBlockKind::Paragraph, 0, 0),
         }
     };
-    let mut spans = Vec::new();
-    inline(body, false, false, &mut spans);
-    Some(MdBlock { kind, level, spans })
+    let mut body_start = 0;
+    if marker_len > 0 {
+        let gap = blank_prefix(t.get(marker_len..).unwrap_or_default());
+        body_start = marker_len + gap;
+        push_run(&mut runs, lead, body_start, (false, false, false), true);
+    }
+    let body = t.get(body_start..).unwrap_or_default();
+    inline(body, lead + body_start, false, false, &mut runs);
+    Line { kind, level, runs }
 }
 
 /// Parse the Markdown subset into blocks. Never fails: anything unrecognised is plain text.
@@ -172,7 +216,87 @@ pub fn parse_markdown(text: &str) -> Vec<MdBlock> {
             spans: Vec::from([plain(text)]),
         }]);
     }
-    text.lines().filter_map(parse_line).collect()
+    text.lines()
+        .map(str::trim_end)
+        .filter(|l| !l.trim().is_empty())
+        .map(|line| {
+            let parsed = tokenize_line(line);
+            let spans = parsed
+                .runs
+                .iter()
+                .filter(|r| !r.marker)
+                .filter_map(|r| {
+                    Some(MdSpan {
+                        text: line.get(r.start..r.start + r.len)?.to_string(),
+                        bold: r.bold,
+                        italic: r.italic,
+                        code: r.code,
+                    })
+                })
+                .collect();
+            MdBlock {
+                kind: parsed.kind,
+                level: parsed.level,
+                spans,
+            }
+        })
+        .collect()
+}
+
+/// A styled stretch of the *raw* editor text, in UTF-16 code units (what `NSRange` and JS strings use).
+/// Ranges are contiguous, in order and cover every character except the `\n` separators.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MdRange {
+    /// Start offset in UTF-16 code units from the beginning of the text.
+    pub start: u32,
+    /// Length in UTF-16 code units.
+    pub length: u32,
+    /// Bold.
+    pub bold: bool,
+    /// Italic.
+    pub italic: bool,
+    /// Inline code.
+    pub code: bool,
+    /// Syntax characters (`**`, `#`, `- `, indentation) that an editor may dim.
+    pub marker: bool,
+    /// Heading level (1..=6) of the line this range is on, else 0.
+    pub heading: u32,
+}
+
+/// Styles the raw text of a note for live editing. Uses the same tokenizer as [`parse_markdown`], so the
+/// editor and the rendered note always agree. Input above the size cap returns no ranges (plain text).
+pub fn highlight_markdown(text: &str) -> Vec<MdRange> {
+    if text.len() > MAX_MARKDOWN_BYTES {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut offset: u32 = 0;
+    for line in text.split('\n') {
+        let parsed = tokenize_line(line);
+        let heading = if parsed.kind == MdBlockKind::Heading {
+            parsed.level
+        } else {
+            0
+        };
+        for r in &parsed.runs {
+            let Some(slice) = line.get(r.start..r.start + r.len) else {
+                continue;
+            };
+            let length = slice.encode_utf16().count() as u32;
+            out.push(MdRange {
+                start: offset,
+                length,
+                bold: r.bold,
+                italic: r.italic,
+                code: r.code,
+                marker: r.marker,
+                heading,
+            });
+            offset += length;
+        }
+        offset += 1;
+    }
+    out
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -292,6 +416,45 @@ mod tests {
         let b = parse_markdown(&big);
         assert_eq!(b.len(), 1);
         assert_eq!(b[0].kind, MdBlockKind::Paragraph);
+    }
+
+    #[test]
+    fn highlight_covers_every_character_with_utf16_offsets() {
+        let text = "## Título ñ\n  - a **b** `c` 😀 *d*\n\nplain _e_";
+        let ranges = highlight_markdown(text);
+        let mut expected = 0u32;
+        for line in text.split('\n') {
+            let start = expected;
+            let covered: u32 = ranges
+                .iter()
+                .filter(|r| {
+                    r.start >= start && r.start < start + line.encode_utf16().count() as u32
+                })
+                .map(|r| r.length)
+                .sum();
+            assert_eq!(covered, line.encode_utf16().count() as u32, "{line}");
+            expected += line.encode_utf16().count() as u32 + 1;
+        }
+        // Contiguous and ordered.
+        let mut at = 0;
+        for r in &ranges {
+            assert!(r.start >= at);
+            at = r.start + r.length;
+        }
+    }
+
+    #[test]
+    fn highlight_marks_syntax_and_styles() {
+        let r = highlight_markdown("# Hi **b**");
+        assert!(r[0].marker && r[0].heading == 1 && r[0].length == 2);
+        let bold = r.iter().find(|r| r.bold && !r.marker).unwrap();
+        assert_eq!((bold.start, bold.length), (7, 1));
+        assert!(r.iter().any(|r| r.marker && !r.bold));
+        assert!(r.iter().filter(|r| r.marker).all(|r| r.heading == 1));
+        let c = highlight_markdown("a `x` b");
+        assert!(c.iter().any(|r| r.code && !r.marker && r.length == 1));
+        assert!(highlight_markdown(&"x".repeat(MAX_MARKDOWN_BYTES + 1)).is_empty());
+        assert_eq!(highlight_markdown("").len(), 0);
     }
 
     #[test]
