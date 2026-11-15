@@ -10,6 +10,7 @@ pub mod codec;
 pub mod crypto;
 #[cfg(feature = "sqlcipher")]
 pub mod db;
+pub mod domain;
 pub mod error;
 pub mod export;
 pub mod generator;
