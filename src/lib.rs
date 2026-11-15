@@ -24,6 +24,7 @@ pub mod ops;
 pub mod passkey;
 pub mod presets;
 pub mod recovery;
+pub mod rich_notes;
 pub mod search;
 pub mod session;
 pub mod side_blob;
