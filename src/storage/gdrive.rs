@@ -11,9 +11,9 @@ use zeroize::Zeroizing;
 use super::provider::{CloudStorageProvider, RemoteFile, Revision, StorageError, WriteCondition};
 use super::transport::{HttpRequest, HttpResponse, HttpTransport, Method};
 
-const API: &str = "https://www.googleapis.com/drive/v3";
-const UPLOAD: &str = "https://www.googleapis.com/upload/drive/v3";
-const FILE_FIELDS: &str = "id,name,size,modifiedTime,headRevisionId";
+pub(super) const API: &str = "https://www.googleapis.com/drive/v3";
+pub(super) const UPLOAD: &str = "https://www.googleapis.com/upload/drive/v3";
+pub(super) const FILE_FIELDS: &str = "id,name,size,modifiedTime,headRevisionId";
 const SPACE: &str = "appDataFolder";
 const PAGE_SIZE: &str = "100";
 /// Hard cap on list pages so a misbehaving server cannot make us loop forever.
@@ -75,7 +75,10 @@ impl<T: HttpTransport, P: TokenProvider> GoogleDriveProvider<T, P> {
     }
 
     /// Send a request (built fresh per attempt), adding the bearer token; retry once on 401.
-    async fn call(&self, build: impl Fn() -> HttpRequest) -> Result<HttpResponse, StorageError> {
+    pub(super) async fn call(
+        &self,
+        build: impl Fn() -> HttpRequest,
+    ) -> Result<HttpResponse, StorageError> {
         let mut force = false;
         loop {
             let token = self.tokens.access_token(force).await?;
@@ -235,12 +238,12 @@ struct Metadata<'a> {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct DriveFile {
-    id: String,
-    name: String,
-    size: Option<String>,
-    modified_time: Option<String>,
-    head_revision_id: Option<String>,
+pub(super) struct DriveFile {
+    pub(super) id: String,
+    pub(super) name: String,
+    pub(super) size: Option<String>,
+    pub(super) modified_time: Option<String>,
+    pub(super) head_revision_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -252,7 +255,7 @@ struct FileList {
 }
 
 impl DriveFile {
-    fn into_remote(self) -> Result<RemoteFile, StorageError> {
+    pub(super) fn into_remote(self) -> Result<RemoteFile, StorageError> {
         let updated_at = self
             .modified_time
             .as_deref()
@@ -278,7 +281,7 @@ impl DriveFile {
 
 /// Map HTTP status to a result. Only coarse substrings of a 403 body are inspected; the body is
 /// never copied into an error.
-fn check_status(resp: HttpResponse) -> Result<HttpResponse, StorageError> {
+pub(super) fn check_status(resp: HttpResponse) -> Result<HttpResponse, StorageError> {
     match resp.status {
         200..=299 => Ok(resp),
         401 => Err(StorageError::Unauthorized),
@@ -299,7 +302,7 @@ fn check_status(resp: HttpResponse) -> Result<HttpResponse, StorageError> {
     }
 }
 
-fn validate_name(name: &str) -> Result<(), StorageError> {
+pub(super) fn validate_name(name: &str) -> Result<(), StorageError> {
     if name.is_empty() || name.len() > 255 || name.chars().any(char::is_control) {
         return Err(StorageError::InvalidInput);
     }
@@ -307,7 +310,7 @@ fn validate_name(name: &str) -> Result<(), StorageError> {
 }
 
 /// Drive ids are URL-safe; refusing anything else prevents path/query injection into URLs.
-fn validate_id(id: &str) -> Result<(), StorageError> {
+pub(super) fn validate_id(id: &str) -> Result<(), StorageError> {
     let ok = !id.is_empty()
         && id.len() <= 128
         && id
@@ -321,12 +324,12 @@ fn validate_id(id: &str) -> Result<(), StorageError> {
 }
 
 /// Escape a value for a Drive `q` string literal.
-fn escape_q(s: &str) -> String {
+pub(super) fn escape_q(s: &str) -> String {
     s.replace('\\', "\\\\").replace('\'', "\\'")
 }
 
 /// Percent-encode everything except RFC 3986 unreserved characters.
-fn pct(s: &str) -> String {
+pub(super) fn pct(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
@@ -339,7 +342,7 @@ fn pct(s: &str) -> String {
 }
 
 /// Build a `multipart/related` body; the boundary is chosen so it cannot occur in the payload.
-fn multipart(meta: &[u8], data: &[u8]) -> (String, Vec<u8>) {
+pub(super) fn multipart(meta: &[u8], data: &[u8]) -> (String, Vec<u8>) {
     let mut n = 0u32;
     let boundary = loop {
         let b = format!("kovakey-boundary-{n}");

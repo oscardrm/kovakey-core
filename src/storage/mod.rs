@@ -2,6 +2,8 @@
 
 #[cfg(feature = "gdrive")]
 pub mod gdrive;
+#[cfg(feature = "gdrive")]
+pub mod gdrive_shared;
 pub mod provider;
 pub mod transport;
 
