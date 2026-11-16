@@ -117,7 +117,12 @@ impl<T: HttpTransport, P: TokenProvider> GoogleDriveProvider<T, P> {
     /// Current metadata (revision, size, modified time) of a shared vault by file id.
     pub async fn shared_vault_metadata(&self, file_id: &str) -> Result<RemoteFile, StorageError> {
         validate_id(file_id)?;
-        let url = format!("{API}/files/{file_id}?fields={}", pct(FILE_FIELDS));
+        // `trashed` is true for a file in the Trash and for one inside a trashed folder. Such a vault was
+        // removed by its owner, so it counts as gone exactly like a permanently deleted one.
+        let url = format!(
+            "{API}/files/{file_id}?fields={}",
+            pct(&format!("{FILE_FIELDS},trashed"))
+        );
         let resp = self
             .call(|| HttpRequest {
                 method: Method::Get,
@@ -126,7 +131,7 @@ impl<T: HttpTransport, P: TokenProvider> GoogleDriveProvider<T, P> {
                 body: Vec::new(),
             })
             .await?;
-        parse_file(&resp.body)
+        parse_live_file(&resp.body)
     }
 
     /// Overwrite a shared vault by file id, honouring `condition` (read-then-write, like personal
@@ -210,6 +215,16 @@ impl<T: HttpTransport, P: TokenProvider> GoogleDriveProvider<T, P> {
         validate_id(&created.id)?;
         Ok(created.id)
     }
+}
+
+/// Like `parse_file`, but a trashed file is `NotFound`.
+fn parse_live_file(body: &[u8]) -> Result<RemoteFile, StorageError> {
+    let file =
+        serde_json::from_slice::<DriveFile>(body).map_err(|_| StorageError::Serialization)?;
+    if file.trashed {
+        return Err(StorageError::NotFound);
+    }
+    file.into_remote()
 }
 
 fn parse_file(body: &[u8]) -> Result<RemoteFile, StorageError> {
@@ -428,6 +443,36 @@ mod tests {
             Err(StorageError::InvalidInput)
         );
         assert!(m.seen().is_empty());
+    }
+
+    #[test]
+    fn a_trashed_vault_is_reported_as_not_found_for_metadata_and_uploads() {
+        let trashed = r#"{"id":"file1","name":"T.vault","size":"1","modifiedTime":"2026-01-01T00:00:00Z","headRevisionId":"r1","trashed":true}"#;
+        let m = Mock::default();
+        m.reply(200, trashed);
+        assert_eq!(
+            block_on(provider(&m).shared_vault_metadata("file1")),
+            Err(StorageError::NotFound)
+        );
+        assert!(m.seen()[0].1.contains("trashed"), "the field is requested");
+
+        // A conditional upload reads the metadata first, so it never writes into a trashed file.
+        let m = Mock::default();
+        m.reply(200, trashed);
+        assert_eq!(
+            block_on(provider(&m).upload_shared_vault(
+                "file1",
+                b"x",
+                WriteCondition::IfRevision(Revision("r1".into()))
+            )),
+            Err(StorageError::NotFound)
+        );
+        assert_eq!(m.seen().len(), 1, "no write after a trashed file");
+
+        // A live file (trashed false or absent) is returned as before.
+        let m = Mock::default();
+        m.reply(200, &file_json("file1", "T.vault", "r1"));
+        assert!(block_on(provider(&m).shared_vault_metadata("file1")).is_ok());
     }
 
     #[test]

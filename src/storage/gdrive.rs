@@ -244,6 +244,9 @@ pub(super) struct DriveFile {
     pub(super) size: Option<String>,
     pub(super) modified_time: Option<String>,
     pub(super) head_revision_id: Option<String>,
+    /// Only requested where it matters (shared vaults): true for a file in the Trash, or in a trashed folder.
+    #[serde(default)]
+    pub(super) trashed: bool,
 }
 
 #[derive(Deserialize)]
