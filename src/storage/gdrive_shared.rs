@@ -134,6 +134,35 @@ impl<T: HttpTransport, P: TokenProvider> GoogleDriveProvider<T, P> {
         parse_live_file(&resp.body)
     }
 
+    /// Whether the signed-in user owns the shared vault file (Drive's `ownedByMe`), so apps can offer owner-only
+    /// actions on every device of the owner. A trashed or missing file is `NotFound`, as in `shared_vault_metadata`.
+    pub async fn shared_vault_owned_by_me(&self, file_id: &str) -> Result<bool, StorageError> {
+        validate_id(file_id)?;
+        let url = format!("{API}/files/{file_id}?fields={}", pct("ownedByMe,trashed"));
+        let resp = self
+            .call(|| HttpRequest {
+                method: Method::Get,
+                url: url.clone(),
+                headers: Vec::new(),
+                body: Vec::new(),
+            })
+            .await?;
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Ownership {
+            #[serde(default)]
+            owned_by_me: bool,
+            #[serde(default)]
+            trashed: bool,
+        }
+        let o: Ownership =
+            serde_json::from_slice(&resp.body).map_err(|_| StorageError::Serialization)?;
+        if o.trashed {
+            return Err(StorageError::NotFound);
+        }
+        Ok(o.owned_by_me)
+    }
+
     /// Overwrite a shared vault by file id, honouring `condition` (read-then-write, like personal
     /// sync). `MustNotExist` is meaningless for an existing id and is rejected.
     pub async fn upload_shared_vault(
@@ -473,6 +502,37 @@ mod tests {
         let m = Mock::default();
         m.reply(200, &file_json("file1", "T.vault", "r1"));
         assert!(block_on(provider(&m).shared_vault_metadata("file1")).is_ok());
+    }
+
+    #[test]
+    fn ownership_reads_owned_by_me_and_treats_trash_as_not_found() {
+        let m = Mock::default();
+        m.reply(200, r#"{"ownedByMe":true}"#)
+            .reply(200, r#"{"ownedByMe":false}"#)
+            .reply(200, "{}")
+            .reply(200, r#"{"ownedByMe":true,"trashed":true}"#)
+            .reply(404, "{}");
+        let p = provider(&m);
+        assert_eq!(block_on(p.shared_vault_owned_by_me("file1")), Ok(true));
+        assert_eq!(block_on(p.shared_vault_owned_by_me("file1")), Ok(false));
+        assert_eq!(
+            block_on(p.shared_vault_owned_by_me("file1")),
+            Ok(false),
+            "absent means not owned"
+        );
+        assert_eq!(
+            block_on(p.shared_vault_owned_by_me("file1")),
+            Err(StorageError::NotFound)
+        );
+        assert_eq!(
+            block_on(p.shared_vault_owned_by_me("file1")),
+            Err(StorageError::NotFound)
+        );
+        assert!(m.seen()[0].1.contains("ownedByMe"));
+        assert_eq!(
+            block_on(provider(&Mock::default()).shared_vault_owned_by_me("../x")),
+            Err(StorageError::InvalidInput)
+        );
     }
 
     #[test]
