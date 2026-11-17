@@ -28,6 +28,7 @@ pub mod recovery;
 pub mod rich_notes;
 pub mod search;
 pub mod session;
+pub mod shared_bundle;
 pub mod side_blob;
 pub mod storage;
 pub mod strength;
