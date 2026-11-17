@@ -920,25 +920,25 @@ impl Database {
         Ok(cur)
     }
 
-    /// Delete a vault: its items (trashed ones included) move to `move_items_to`, then the vault
-    /// is tombstoned.
-    pub fn delete_vault(
-        &mut self,
-        ctx: &WriteCtx<'_>,
-        id: &str,
-        move_items_to: &str,
-    ) -> Result<()> {
-        if id == move_items_to {
-            return Err(Error::InvalidInput);
-        }
+    /// Delete a vault (ADR 0037): its live items go to the Trash (already trashed ones stay there)
+    /// and are reassigned to a live fallback vault (the default one if live, else the first by
+    /// creation time and id), then the vault is tombstoned. The last live vault cannot be deleted.
+    pub fn delete_vault(&mut self, ctx: &WriteCtx<'_>, id: &str) -> Result<()> {
         let tx = self.begin(ctx)?;
-        if !vault_is_live(&tx, id)? || !vault_is_live(&tx, move_items_to)? {
+        if !vault_is_live(&tx, id)? {
             return Err(Error::NotFound);
         }
+        let fallback = live_vaults(&tx)?
+            .into_iter()
+            .find(|v| v.id != id)
+            .map(|v| v.id)
+            .ok_or(Error::InvalidInput)?;
         tx.execute(
-            "UPDATE items SET vault_id=?2,updated_at=max(?3,updated_at+1),updated_by=?4
+            "UPDATE items SET
+                 trashed_at=CASE WHEN trashed_at IS NULL THEN max(?3,updated_at+1) ELSE trashed_at END,
+                 vault_id=?2,updated_at=max(?3,updated_at+1),updated_by=?4
              WHERE vault_id=?1 AND deleted_at IS NULL",
-            params![id, move_items_to, ctx.now_ms, ctx.device_id],
+            params![id, fallback, ctx.now_ms, ctx.device_id],
         )
         .map_err(db_err)?;
         tx.execute(
@@ -1800,7 +1800,7 @@ impl VaultStore for Database {
         fn list_vaults(&Self) -> Result<Vec<VaultMeta>>;
         fn create_vault(&mut Self, ctx: &WriteCtx<'_>, name: &str, color: &str, badge: Option<&str>) -> Result<VaultMeta>;
         fn update_vault(&mut Self, ctx: &WriteCtx<'_>, id: &str, upd: &VaultUpdate) -> Result<VaultMeta>;
-        fn delete_vault(&mut Self, ctx: &WriteCtx<'_>, id: &str, move_items_to: &str) -> Result<()>;
+        fn delete_vault(&mut Self, ctx: &WriteCtx<'_>, id: &str) -> Result<()>;
         fn ensure_default_vault(&mut Self, ctx: &WriteCtx<'_>) -> Result<()>;
         fn record_use(&mut Self, ctx: &WriteCtx<'_>, id: &str) -> Result<()>;
         fn list_items(&Self) -> Result<Vec<ItemSummary>>;

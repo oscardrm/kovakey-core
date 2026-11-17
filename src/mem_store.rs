@@ -863,21 +863,32 @@ impl VaultStore for MemStore {
         })
     }
 
-    fn delete_vault(&mut self, ctx: &WriteCtx<'_>, id: &str, move_items_to: &str) -> Result<()> {
-        if id == move_items_to {
-            return Err(Error::InvalidInput);
-        }
+    fn delete_vault(&mut self, ctx: &WriteCtx<'_>, id: &str) -> Result<()> {
         self.tx(ctx, |s| {
-            if !vault_is_live(s, id) || !vault_is_live(s, move_items_to) {
+            if !vault_is_live(s, id) {
                 return Err(Error::NotFound);
             }
+            let mut live: Vec<&VaultMeta> = s
+                .vault_meta
+                .iter()
+                .filter(|v| v.deleted_at.is_none() && v.id != id)
+                .collect();
+            live.sort_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)));
+            let fallback = live
+                .first()
+                .map(|v| v.id.clone())
+                .ok_or(Error::InvalidInput)?;
             for it in s
                 .items
                 .iter_mut()
                 .filter(|i| i.vault_id == id && i.deleted_at.is_none())
             {
-                it.vault_id = move_items_to.to_string();
-                it.updated_at = bump(it.updated_at, ctx.now_ms);
+                let t = bump(it.updated_at, ctx.now_ms);
+                if it.trashed_at.is_none() {
+                    it.trashed_at = Some(t);
+                }
+                it.vault_id = fallback.clone();
+                it.updated_at = t;
                 it.updated_by = ctx.device_id.to_string();
             }
             let v = s

@@ -432,9 +432,10 @@ pub trait VaultStore {
         id: &str,
         upd: &VaultUpdate,
     ) -> Result<VaultMeta>;
-    /// Delete a vault: every item in it (including trashed ones) moves to the live vault
-    /// `move_items_to`, then the vault is tombstoned. Fails if `id == move_items_to`.
-    fn delete_vault(&mut self, ctx: &WriteCtx<'_>, id: &str, move_items_to: &str) -> Result<()>;
+    /// Delete a vault (ADR 0037): its live items go to the Trash and are reassigned to a live
+    /// fallback vault (the default one if live, else the first by creation time and id), then the
+    /// vault is tombstoned. Fails with `InvalidInput` when it is the last live vault.
+    fn delete_vault(&mut self, ctx: &WriteCtx<'_>, id: &str) -> Result<()>;
     /// Create the default vault if the store has never had one (never resurrects a deleted one).
     fn ensure_default_vault(&mut self, ctx: &WriteCtx<'_>) -> Result<()>;
     /// Record one use (copy/autofill).
