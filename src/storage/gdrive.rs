@@ -346,11 +346,6 @@ pub(super) fn pct(s: &str) -> String {
 
 /// Build a `multipart/related` body; the boundary is chosen so it cannot occur in the payload.
 pub(super) fn multipart(meta: &[u8], data: &[u8]) -> (String, Vec<u8>) {
-    multipart_typed(meta, data, "application/octet-stream")
-}
-
-/// Like `multipart`, with an explicit `Content-Type` for the data part.
-pub(super) fn multipart_typed(meta: &[u8], data: &[u8], data_type: &str) -> (String, Vec<u8>) {
     let mut n = 0u32;
     let boundary = loop {
         let b = format!("kovakey-boundary-{n}");
@@ -367,7 +362,7 @@ pub(super) fn multipart_typed(meta: &[u8], data: &[u8], data_type: &str) -> (Str
     );
     body.extend_from_slice(meta);
     body.extend_from_slice(
-        format!("\r\n--{boundary}\r\nContent-Type: {data_type}\r\n\r\n").as_bytes(),
+        format!("\r\n--{boundary}\r\nContent-Type: application/octet-stream\r\n\r\n").as_bytes(),
     );
     body.extend_from_slice(data);
     body.extend_from_slice(format!("\r\n--{boundary}--").as_bytes());

@@ -11,7 +11,7 @@ use core::fmt;
 use serde::{Deserialize, Serialize};
 
 use super::gdrive::{
-    escape_q, multipart_typed, pct, validate_id, validate_name, DriveFile, GoogleDriveProvider,
+    escape_q, multipart, pct, validate_id, validate_name, DriveFile, GoogleDriveProvider,
     TokenProvider, API, FILE_FIELDS, UPLOAD,
 };
 use super::provider::{RemoteFile, StorageError, WriteCondition};
@@ -20,11 +20,6 @@ use super::transport::{HttpRequest, HttpTransport, Method};
 /// Name of the folder that holds shared vaults in the owner's Drive.
 pub const SHARED_FOLDER_NAME: &str = "Kovakey Shared";
 const FOLDER_MIME: &str = "application/vnd.google-apps.folder";
-/// MIME type of every shared vault file in Drive. A type of its own lets the Google Picker (desktop/mobile
-/// mode, which can only filter by `mimetypes` or `file_ids`) show a member just the vault files, not their
-/// whole Drive. It is a plain identifier, not a secret. Files created before this type existed get it on
-/// their next upload.
-pub const SHARED_VAULT_MIME: &str = "application/vnd.kovakey.shared-vault";
 const MAX_DISPLAY_NAME: usize = 80;
 const MAX_EMAIL: usize = 254;
 const MAX_MESSAGE: usize = 500;
@@ -125,7 +120,6 @@ impl<T: HttpTransport, P: TokenProvider> GoogleDriveProvider<T, P> {
         let folder_id = self.find_or_create_shared_folder().await?;
         let meta = serde_json::to_vec(&CreateMeta {
             name,
-            mime_type: SHARED_VAULT_MIME,
             parents: [&folder_id],
             app_properties: AppProps {
                 kovakey: "shared-vault",
@@ -133,7 +127,7 @@ impl<T: HttpTransport, P: TokenProvider> GoogleDriveProvider<T, P> {
             },
         })
         .map_err(|_| StorageError::Serialization)?;
-        let (content_type, body) = multipart_typed(&meta, data, SHARED_VAULT_MIME);
+        let (content_type, body) = multipart(&meta, data);
         let url = format!(
             "{UPLOAD}/files?uploadType=multipart&fields={}",
             pct(FILE_FIELDS)
@@ -372,23 +366,16 @@ impl<T: HttpTransport, P: TokenProvider> GoogleDriveProvider<T, P> {
             }
             WriteCondition::Any => {}
         }
-        // Multipart (metadata + content) so every upload also stamps the shared-vault MIME type: files created
-        // before it existed are migrated the next time their owner or a member syncs them.
-        let meta = serde_json::to_vec(&UpdateMeta {
-            mime_type: SHARED_VAULT_MIME,
-        })
-        .map_err(|_| StorageError::Serialization)?;
-        let (content_type, body) = multipart_typed(&meta, data, SHARED_VAULT_MIME);
         let url = format!(
-            "{UPLOAD}/files/{file_id}?uploadType=multipart&fields={}",
+            "{UPLOAD}/files/{file_id}?uploadType=media&fields={}",
             pct(FILE_FIELDS)
         );
         let resp = self
             .call(|| HttpRequest {
                 method: Method::Patch,
                 url: url.clone(),
-                headers: vec![("Content-Type".into(), content_type.clone())],
-                body: body.clone(),
+                headers: vec![("Content-Type".into(), "application/octet-stream".into())],
+                body: data.to_vec(),
             })
             .await?;
         parse_file(&resp.body)
@@ -555,15 +542,8 @@ struct AppProps {
 #[serde(rename_all = "camelCase")]
 struct CreateMeta<'a> {
     name: &'a str,
-    mime_type: &'a str,
     parents: [&'a str; 1],
     app_properties: AppProps,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct UpdateMeta<'a> {
-    mime_type: &'a str,
 }
 
 #[derive(Serialize)]
@@ -688,18 +668,6 @@ mod tests {
         assert!(file.contains(r#""parents":["fold1"]"#));
         assert!(file.contains(r#""appProperties":{"kovakey":"shared-vault","v":"1"}"#));
         assert!(!file.contains("appDataFolder"));
-        // The dedicated MIME type is what lets the Picker filter to vault files (kovakey-core#4).
-        assert!(file.contains(&format!(r#""mimeType":"{SHARED_VAULT_MIME}""#)));
-        assert!(file.contains(&format!("Content-Type: {SHARED_VAULT_MIME}")));
-        assert!(!file.contains("application/octet-stream"));
-    }
-
-    #[test]
-    fn shared_vault_mime_is_a_stable_vendor_type() {
-        // The apps hard-code nothing: they read this constant. Changing it would hide every existing vault from
-        // the filtered Picker, so a change must be deliberate.
-        assert_eq!(SHARED_VAULT_MIME, "application/vnd.kovakey.shared-vault");
-        assert!(SHARED_VAULT_MIME.starts_with("application/vnd."));
     }
 
     #[test]
@@ -842,15 +810,6 @@ mod tests {
         .unwrap();
         assert_eq!(f.revision, Revision("r2".into()));
         assert_eq!(m.seen()[1].0, Method::Patch);
-        // Every upload also stamps the MIME type, which migrates files created before it existed.
-        assert!(m.seen()[1].1.contains("uploadType=multipart"));
-        let body = String::from_utf8_lossy(&m.seen()[1].2).into_owned();
-        assert!(body.contains(&format!(r#"{{"mimeType":"{SHARED_VAULT_MIME}"}}"#)));
-        assert!(
-            body.contains("\r\n\r\nx\r\n--"),
-            "the vault bytes are the second part"
-        );
-        assert!(!body.contains("application/octet-stream"));
         assert_eq!(
             block_on(provider(&Mock::default()).upload_shared_vault(
                 "file1",
