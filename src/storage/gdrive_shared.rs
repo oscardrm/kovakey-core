@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use super::gdrive::{
     escape_q, multipart, pct, validate_id, validate_name, DriveFile, GoogleDriveProvider,
-    TokenProvider, API, FILE_FIELDS, UPLOAD,
+    TokenProvider, API, FILE_FIELDS, UPLOAD, VAULT_FILE_MIME,
 };
 use super::provider::{RemoteFile, StorageError, WriteCondition};
 use super::transport::{HttpRequest, HttpTransport, Method};
@@ -22,7 +22,6 @@ pub const SHARED_FOLDER_NAME: &str = "Kovakey Shared";
 const FOLDER_MIME: &str = "application/vnd.google-apps.folder";
 const MAX_DISPLAY_NAME: usize = 80;
 const MAX_EMAIL: usize = 254;
-const MAX_MESSAGE: usize = 500;
 /// Drive's largest `permissions.list` page.
 const PERMISSION_PAGE_SIZE: &str = "100";
 /// Hard cap on permission pages (Drive allows a few hundred people per file), so a misbehaving server cannot make
@@ -149,29 +148,19 @@ impl<T: HttpTransport, P: TokenProvider> GoogleDriveProvider<T, P> {
         Ok((reference, file))
     }
 
-    /// Grant `email` edit access to a shared vault and let Google send the notification. The
-    /// message must not contain the vault password (the UI never offers it).
-    pub async fn share_shared_vault(
-        &self,
-        file_id: &str,
-        email: &str,
-        message: &str,
-    ) -> Result<(), StorageError> {
+    /// Grant `email` edit access to a shared vault and let Google send its standard notification. No
+    /// `emailMessage` is sent: Google's own email names the file and the app, and extra text only adds spam
+    /// risk. The vault password is never part of a share.
+    pub async fn share_shared_vault(&self, file_id: &str, email: &str) -> Result<(), StorageError> {
         validate_id(file_id)?;
         validate_email(email)?;
-        if message.len() > MAX_MESSAGE || message.chars().any(|c| c.is_control() && c != '\n') {
-            return Err(StorageError::InvalidInput);
-        }
         let body = serde_json::to_vec(&Permission {
             kind: "user",
             role: "writer",
             email_address: email,
         })
         .map_err(|_| StorageError::Serialization)?;
-        let url = format!(
-            "{API}/files/{file_id}/permissions?sendNotificationEmail=true&emailMessage={}&fields=id",
-            pct(message)
-        );
+        let url = format!("{API}/files/{file_id}/permissions?sendNotificationEmail=true&fields=id");
         self.call(|| HttpRequest {
             method: Method::Post,
             url: url.clone(),
@@ -374,7 +363,7 @@ impl<T: HttpTransport, P: TokenProvider> GoogleDriveProvider<T, P> {
             .call(|| HttpRequest {
                 method: Method::Patch,
                 url: url.clone(),
-                headers: vec![("Content-Type".into(), "application/octet-stream".into())],
+                headers: vec![("Content-Type".into(), VAULT_FILE_MIME.into())],
                 body: data.to_vec(),
             })
             .await?;
@@ -671,6 +660,20 @@ mod tests {
     }
 
     #[test]
+    fn create_stores_the_vault_with_the_picker_filter_type() {
+        // The Picker is filtered to `VAULT_FILE_MIME`: the file must be uploaded as exactly that, and the metadata
+        // must not set its own `mimeType` (Drive would then keep that one and the vault would vanish from the Picker).
+        assert_eq!(VAULT_FILE_MIME, "application/octet-stream");
+        let m = Mock::default();
+        m.reply(200, r#"{"files":[{"id":"fold9"}]}"#)
+            .reply(200, &file_json("file1", "T.vault", "r1"));
+        block_on(provider(&m).create_shared_vault("T.vault", b"x")).unwrap();
+        let file = String::from_utf8_lossy(&m.seen()[1].2).into_owned();
+        assert!(file.contains(&format!("Content-Type: {VAULT_FILE_MIME}\r\n\r\nx")));
+        assert!(!file.contains("mimeType"));
+    }
+
+    #[test]
     fn create_reuses_existing_folder() {
         let m = Mock::default();
         m.reply(200, r#"{"files":[{"id":"fold9"}]}"#)
@@ -684,13 +687,13 @@ mod tests {
     fn share_sends_writer_permission_and_email() {
         let m = Mock::default();
         m.reply(200, r#"{"id":"p1"}"#);
-        block_on(provider(&m).share_shared_vault("file1", "bob@example.com", "Open Kovakey"))
-            .unwrap();
+        block_on(provider(&m).share_shared_vault("file1", "bob@example.com")).unwrap();
         let seen = m.seen();
         assert_eq!(seen[0].0, Method::Post);
         assert!(seen[0].1.contains("/files/file1/permissions"));
         assert!(seen[0].1.contains("sendNotificationEmail=true"));
-        assert!(seen[0].1.contains("emailMessage=Open%20Kovakey"));
+        // Google's standard notification only: no custom text in the email.
+        assert!(!seen[0].1.contains("emailMessage"));
         let body = String::from_utf8_lossy(&seen[0].2).into_owned();
         assert!(body.contains(r#""type":"user""#) && body.contains(r#""role":"writer""#));
         assert!(body.contains(r#""emailAddress":"bob@example.com""#));
@@ -710,17 +713,13 @@ mod tests {
             "@b.c",
         ] {
             assert_eq!(
-                block_on(p.share_shared_vault("file1", email, "")),
+                block_on(p.share_shared_vault("file1", email)),
                 Err(StorageError::InvalidInput),
                 "{email}"
             );
         }
         assert_eq!(
-            block_on(p.share_shared_vault("a/b", "a@b.c", "")),
-            Err(StorageError::InvalidInput)
-        );
-        assert_eq!(
-            block_on(p.share_shared_vault("file1", "a@b.c", "x\r\ny\u{0}")),
+            block_on(p.share_shared_vault("a/b", "a@b.c")),
             Err(StorageError::InvalidInput)
         );
         assert!(m.seen().is_empty());

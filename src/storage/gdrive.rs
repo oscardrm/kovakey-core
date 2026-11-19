@@ -14,6 +14,9 @@ use super::transport::{HttpRequest, HttpResponse, HttpTransport, Method};
 pub(super) const API: &str = "https://www.googleapis.com/drive/v3";
 pub(super) const UPLOAD: &str = "https://www.googleapis.com/upload/drive/v3";
 pub(super) const FILE_FIELDS: &str = "id,name,size,modifiedTime,headRevisionId";
+/// Media type of every `.vault` file this provider writes to Drive (personal and shared): opaque ciphertext.
+/// The apps pass it as the Google Picker's `mimetypes` filter, so it must stay what the uploads send.
+pub const VAULT_FILE_MIME: &str = "application/octet-stream";
 const SPACE: &str = "appDataFolder";
 const PAGE_SIZE: &str = "100";
 /// Hard cap on list pages so a misbehaving server cannot make us loop forever.
@@ -167,7 +170,7 @@ impl<T: HttpTransport, P: TokenProvider> CloudStorageProvider for GoogleDrivePro
                 self.call(|| HttpRequest {
                     method: Method::Patch,
                     url: url.clone(),
-                    headers: vec![("Content-Type".into(), "application/octet-stream".into())],
+                    headers: vec![("Content-Type".into(), VAULT_FILE_MIME.into())],
                     body: data.to_vec(),
                 })
                 .await?
@@ -362,7 +365,7 @@ pub(super) fn multipart(meta: &[u8], data: &[u8]) -> (String, Vec<u8>) {
     );
     body.extend_from_slice(meta);
     body.extend_from_slice(
-        format!("\r\n--{boundary}\r\nContent-Type: application/octet-stream\r\n\r\n").as_bytes(),
+        format!("\r\n--{boundary}\r\nContent-Type: {VAULT_FILE_MIME}\r\n\r\n").as_bytes(),
     );
     body.extend_from_slice(data);
     body.extend_from_slice(format!("\r\n--{boundary}--").as_bytes());
