@@ -614,7 +614,7 @@ impl Drop for Passkey {
 /// inside the encrypted personal vault so every device of the person has it, and the Recovery Key
 /// restores it. `private_key` is the 32-byte X25519 secret, blank once tombstoned; it never leaves
 /// the core. The record is immutable except for its tombstone.
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct IdentityKeyRecord {
     /// Record id.
     pub id: String,
@@ -640,6 +640,36 @@ impl fmt::Debug for IdentityKeyRecord {
             .field("updated_at", &self.updated_at)
             .field("deleted_at", &self.deleted_at)
             .finish()
+    }
+}
+
+/// Total order for the merge tie-break. The private key is compared last, only when every other
+/// field (including the public key it determines) is equal, so valid records never reach it.
+impl Ord for IdentityKeyRecord {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (
+            &self.id,
+            self.created_at,
+            self.updated_at,
+            &self.updated_by,
+            self.deleted_at,
+            &self.public_key,
+        )
+            .cmp(&(
+                &other.id,
+                other.created_at,
+                other.updated_at,
+                &other.updated_by,
+                other.deleted_at,
+                &other.public_key,
+            ))
+            .then_with(|| self.private_key.cmp(&other.private_key))
+    }
+}
+
+impl PartialOrd for IdentityKeyRecord {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
     }
 }
 

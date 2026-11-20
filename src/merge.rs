@@ -464,6 +464,26 @@ mod tests {
             })
     }
 
+    /// Identity keys: the fixed RFC 9180 test key pair (fake), live or tombstoned (key blanked).
+    fn arb_identity() -> impl Strategy<Value = IdentityKeyRecord> {
+        (0u8..3, 0i64..4, 0u8..3, proptest::option::of(0i64..4)).prop_map(|(id, t, dev, del)| {
+            let hex = |h: &str| data_encoding::HEXLOWER.decode(h.as_bytes()).unwrap();
+            IdentityKeyRecord {
+                id: format!("ik{id}"),
+                private_key: if del.is_some() {
+                    Vec::new()
+                } else {
+                    hex("497b4502664cfea5d5af0b39934dac72242a74f8480451e1aee7d6a53320333d")
+                },
+                public_key: hex("430f4b9859665145a6b1ba274024487bd66f03a2dd577d7753c68d7d7d00c00c"),
+                created_at: 0,
+                updated_at: t,
+                updated_by: format!("d{dev}"),
+                deleted_at: del,
+            }
+        })
+    }
+
     fn arb_snap() -> impl Strategy<Value = Snapshot> {
         (
             proptest::collection::vec(arb_item(), 0..5),
@@ -472,9 +492,18 @@ mod tests {
             proptest::collection::vec(arb_block(), 0..4),
             proptest::collection::vec(arb_category(), 0..3),
             proptest::collection::vec(arb_category_field(), 0..3),
+            proptest::collection::vec(arb_identity(), 0..3),
         )
             .prop_map(
-                |(items, item_fields, item_tags, note_blocks, categories, category_fields)| {
+                |(
+                    items,
+                    item_fields,
+                    item_tags,
+                    note_blocks,
+                    categories,
+                    category_fields,
+                    identity_keys,
+                )| {
                     // Normalize duplicate keys inside one generated side.
                     merge(
                         &Snapshot::default(),
@@ -485,11 +514,36 @@ mod tests {
                             note_blocks,
                             categories,
                             category_fields,
+                            identity_keys,
                             ..Default::default()
                         },
                     )
                 },
             )
+    }
+
+    #[test]
+    fn a_tombstoned_identity_key_wins_over_the_live_one_and_stays_blank() {
+        let live = IdentityKeyRecord {
+            id: "ik".into(),
+            private_key: vec![7; 32],
+            public_key: vec![8; 32],
+            created_at: 1,
+            updated_at: 1,
+            updated_by: "a".into(),
+            deleted_at: None,
+        };
+        let mut dead = live.clone();
+        dead.private_key = Vec::new();
+        dead.updated_at = 2;
+        dead.updated_by = "b".into();
+        dead.deleted_at = Some(2);
+        for (l, r) in [(&live, &dead), (&dead, &live)] {
+            let m = merge_records(std::slice::from_ref(l), std::slice::from_ref(r));
+            assert_eq!(m.len(), 1);
+            assert_eq!(m[0].deleted_at, Some(2));
+            assert!(m[0].private_key.is_empty());
+        }
     }
 
     proptest! {

@@ -533,6 +533,8 @@ pub trait VaultStore {
     /// Live identity keys for shared member vaults, oldest first. **Core-internal**: carries the
     /// private keys; never expose it through FFI/wasm (see [`crate::session::Session`]).
     fn live_identity_keys(&self) -> Result<Vec<crate::models::IdentityKeyRecord>>;
+    /// Public keys of the live identity keys, oldest first (no private key is loaded).
+    fn live_identity_public_keys(&self) -> Result<Vec<Vec<u8>>>;
     /// Store a new identity key (validated by the caller) and return its record id.
     fn add_identity_key(
         &mut self,

@@ -64,42 +64,43 @@ pub fn encode_snapshot(snapshot: &Snapshot) -> Result<EncodedSnapshot<'_>> {
 }
 
 fn encode_at(snapshot: &Snapshot, version: u8) -> Result<EncodedSnapshot<'_>> {
+    fn ser<T: serde::Serialize>(v: &T) -> Result<Zeroizing<Vec<u8>>> {
+        postcard::to_allocvec(v)
+            .map(Zeroizing::new)
+            .map_err(|_| Error::Corrupted)
+    }
+    // Every part holds plaintext secrets: each is wiped on drop, and the payload is allocated
+    // once at its final size so no reallocation leaves an unwiped copy behind.
     let (wire, mut external) = v1::Payload::from_snapshot(snapshot)?;
-    let mut bytes = postcard::to_allocvec(&wire).map_err(|_| Error::Corrupted)?;
+    let mut parts = vec![ser(&wire)?];
+    drop(wire);
     if version >= 2 {
-        let ext = v2::Ext::from_snapshot(snapshot);
-        let tail = postcard::to_allocvec(&ext).map_err(|_| Error::Corrupted)?;
-        bytes.extend_from_slice(&tail);
+        parts.push(ser(&v2::Ext::from_snapshot(snapshot))?);
     }
     if version >= 3 {
-        let ext = v3::Ext::from_snapshot(snapshot);
-        let tail = postcard::to_allocvec(&ext).map_err(|_| Error::Corrupted)?;
-        bytes.extend_from_slice(&tail);
+        parts.push(ser(&v3::Ext::from_snapshot(snapshot))?);
     }
     if version >= 4 {
-        let ext = v4::Ext::from_snapshot(snapshot);
-        let tail = postcard::to_allocvec(&ext).map_err(|_| Error::Corrupted)?;
-        bytes.extend_from_slice(&tail);
+        parts.push(ser(&v4::Ext::from_snapshot(snapshot))?);
     }
     if version >= 5 {
         let (ext, blobs) = v5::Ext::from_snapshot(snapshot)?;
-        let tail = postcard::to_allocvec(&ext).map_err(|_| Error::Corrupted)?;
-        bytes.extend_from_slice(&tail);
+        parts.push(ser(&ext)?);
         external.extend(blobs);
     }
     if version >= 6 {
-        let ext = v6::Ext::from_snapshot(snapshot)?;
-        let tail = postcard::to_allocvec(&ext).map_err(|_| Error::Corrupted)?;
-        bytes.extend_from_slice(&tail);
+        parts.push(ser(&v6::Ext::from_snapshot(snapshot)?)?);
     }
     if version >= 7 {
-        let ext = v7::Ext::from_snapshot(snapshot)?;
-        let tail = postcard::to_allocvec(&ext).map_err(|_| Error::Corrupted)?;
-        bytes.extend_from_slice(&tail);
+        parts.push(ser(&v7::Ext::from_snapshot(snapshot)?)?);
+    }
+    let mut payload = Zeroizing::new(Vec::with_capacity(parts.iter().map(|p| p.len()).sum()));
+    for part in &parts {
+        payload.extend_from_slice(part);
     }
     Ok(EncodedSnapshot {
         version,
-        payload: Zeroizing::new(bytes),
+        payload,
         external,
     })
 }
@@ -2026,6 +2027,44 @@ mod tests {
         let bytes = std::fs::read(GOLDEN_V7).unwrap();
         let out = decode_snapshot(7, &bytes, &mut attach_resolver).unwrap();
         assert_eq!(out, identity_sample(true));
+    }
+
+    #[test]
+    fn decode_rejects_an_identity_tombstone_that_still_carries_a_key() {
+        // Same wire shape as `v7::IdentityKeyW` (postcard is not self-describing).
+        #[derive(serde::Serialize)]
+        struct W {
+            id: String,
+            private_key: Vec<u8>,
+            public_key: Vec<u8>,
+            created_at: i64,
+            updated_at: i64,
+            updated_by: String,
+            deleted_at: Option<i64>,
+        }
+        #[derive(serde::Serialize)]
+        struct Ext {
+            identity_keys: Vec<W>,
+        }
+        let live = identity("id-1", None);
+        let ext = Ext {
+            identity_keys: vec![W {
+                id: "id-1".into(),
+                private_key: live.private_key.clone(),
+                public_key: live.public_key.clone(),
+                created_at: 1,
+                updated_at: 2,
+                updated_by: "d".into(),
+                deleted_at: Some(3),
+            }],
+        };
+        let snap = vaulted_sample(false);
+        let mut bytes = encode_at(&snap, 6).unwrap().payload.to_vec();
+        bytes.extend_from_slice(&postcard::to_allocvec(&ext).unwrap());
+        assert_eq!(
+            decode_snapshot(7, &bytes, &mut attach_resolver).err(),
+            Some(Error::Corrupted)
+        );
     }
 
     #[test]

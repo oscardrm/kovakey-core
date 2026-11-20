@@ -1457,6 +1457,18 @@ impl VaultStore for MemStore {
         Ok(keys)
     }
 
+    fn live_identity_public_keys(&self) -> Result<Vec<Vec<u8>>> {
+        let mut keys: Vec<_> = self
+            .snap
+            .identity_keys
+            .iter()
+            .filter(|k| k.deleted_at.is_none())
+            .map(|k| (k.created_at, k.id.clone(), k.public_key.clone()))
+            .collect();
+        keys.sort();
+        Ok(keys.into_iter().map(|(_, _, pk)| pk).collect())
+    }
+
     fn add_identity_key(
         &mut self,
         ctx: &WriteCtx<'_>,

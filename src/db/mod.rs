@@ -209,6 +209,41 @@ mod tests {
     }
 
     #[test]
+    fn a_newer_identity_key_tombstone_blanks_the_stored_private_key() {
+        use crate::models::{IdentityKeyRecord, Snapshot};
+        let mut db = Database::open_in_memory(&key(1)).unwrap();
+        let live = IdentityKeyRecord {
+            id: "ik".into(),
+            private_key: vec![7; 32],
+            public_key: vec![8; 32],
+            created_at: 1,
+            updated_at: 1,
+            updated_by: "a".into(),
+            deleted_at: None,
+        };
+        let mut dead = live.clone();
+        dead.private_key = Vec::new();
+        dead.updated_at = 2;
+        dead.updated_by = "b".into();
+        dead.deleted_at = Some(2);
+        let with = |k: IdentityKeyRecord| Snapshot {
+            identity_keys: vec![k],
+            ..Default::default()
+        };
+        db.merge_remote(&with(live.clone())).unwrap();
+        assert_eq!(db.live_identity_keys().unwrap().len(), 1);
+        db.merge_remote(&with(dead)).unwrap();
+        // An older live copy arriving later does not resurrect it.
+        db.merge_remote(&with(live)).unwrap();
+        assert!(db.live_identity_keys().unwrap().is_empty());
+        assert!(db.live_identity_public_keys().unwrap().is_empty());
+        let stored = db.load_snapshot().unwrap().identity_keys;
+        assert_eq!(stored.len(), 1);
+        assert!(stored[0].private_key.is_empty());
+        assert_eq!(stored[0].deleted_at, Some(2));
+    }
+
+    #[test]
     fn open_creates_schema_at_latest_version() {
         let db = Database::open_in_memory(&key(1)).unwrap();
         assert_eq!(db.schema_version().unwrap(), LATEST_VERSION);

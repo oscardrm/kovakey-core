@@ -33,6 +33,10 @@ pub enum Error {
     /// Database failure (details withheld to avoid leaking data).
     #[error("database error")]
     Database,
+    /// A shared member vault was re-keyed (a newer key epoch exists): fetch this member's new
+    /// wrap and reopen the vault from the newer file.
+    #[error("vault was re-keyed")]
+    Rekeyed,
 }
 
 /// Crate result alias.

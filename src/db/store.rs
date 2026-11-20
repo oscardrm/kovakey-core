@@ -1547,6 +1547,18 @@ impl Database {
         rows.collect::<rusqlite::Result<_>>().map_err(db_err)
     }
 
+    /// Public keys of the live identity keys, oldest first.
+    pub fn live_identity_public_keys(&self) -> Result<Vec<Vec<u8>>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT public_key FROM identity_keys WHERE deleted_at IS NULL ORDER BY created_at,id",
+            )
+            .map_err(db_err)?;
+        let rows = stmt.query_map([], |r| r.get(0)).map_err(db_err)?;
+        rows.collect::<rusqlite::Result<_>>().map_err(db_err)
+    }
+
     /// Store a new identity key and return its record id.
     pub fn add_identity_key(
         &mut self,
@@ -1879,6 +1891,7 @@ impl VaultStore for Database {
         fn passkey_secret(&Self, id: &str) -> Result<(PasskeyInfo, Zeroizing<Vec<u8>>)>;
         fn delete_passkey(&mut Self, ctx: &WriteCtx<'_>, id: &str) -> Result<()>;
         fn live_identity_keys(&Self) -> Result<Vec<IdentityKeyRecord>>;
+        fn live_identity_public_keys(&Self) -> Result<Vec<Vec<u8>>>;
         fn add_identity_key(&mut Self, ctx: &WriteCtx<'_>, private_key: &[u8], public_key: &[u8]) -> Result<String>;
         fn merge_remote(&mut Self, remote: &Snapshot) -> Result<()>;
     }
