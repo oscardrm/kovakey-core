@@ -21,8 +21,8 @@ use zeroize::Zeroizing;
 use super::{db_err, Database};
 use crate::error::{Error, Result};
 use crate::models::{
-    BlockKind, Category, CategoryField, HistoryEntry, ItemType, NoteBlock, Snapshot, Tag,
-    VaultMeta, DEFAULT_VAULT_ID,
+    BlockKind, Category, CategoryField, HistoryEntry, IdentityKeyRecord, ItemType, NoteBlock,
+    Snapshot, Tag, VaultMeta, DEFAULT_VAULT_ID,
 };
 use crate::notes::detect_language;
 use crate::ops::{
@@ -1522,6 +1522,52 @@ impl Database {
 }
 
 impl Database {
+    /// Live identity keys, oldest first (core-internal: includes the private keys).
+    pub fn live_identity_keys(&self) -> Result<Vec<IdentityKeyRecord>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id,private_key,public_key,created_at,updated_at,updated_by,deleted_at
+                 FROM identity_keys WHERE deleted_at IS NULL ORDER BY created_at,id",
+            )
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(IdentityKeyRecord {
+                    id: r.get(0)?,
+                    private_key: r.get(1)?,
+                    public_key: r.get(2)?,
+                    created_at: r.get(3)?,
+                    updated_at: r.get(4)?,
+                    updated_by: r.get(5)?,
+                    deleted_at: r.get(6)?,
+                })
+            })
+            .map_err(db_err)?;
+        rows.collect::<rusqlite::Result<_>>().map_err(db_err)
+    }
+
+    /// Store a new identity key and return its record id.
+    pub fn add_identity_key(
+        &mut self,
+        ctx: &WriteCtx<'_>,
+        private_key: &[u8],
+        public_key: &[u8],
+    ) -> Result<String> {
+        let tx = self.begin(ctx)?;
+        let id = new_id(ctx)?;
+        tx.execute(
+            "INSERT INTO identity_keys(id,private_key,public_key,created_at,updated_at,updated_by)
+             VALUES(?1,?2,?3,?4,?4,?5)",
+            params![id, private_key, public_key, ctx.now_ms, ctx.device_id],
+        )
+        .map_err(db_err)?;
+        tx.commit().map_err(db_err)?;
+        Ok(id)
+    }
+}
+
+impl Database {
     /// Store a passkey on a live, non-trashed item (ADR 0020).
     pub fn add_passkey(
         &mut self,
@@ -1832,6 +1878,8 @@ impl VaultStore for Database {
         fn passkeys_for_rp(&Self, rp_id: &str) -> Result<Vec<PasskeyInfo>>;
         fn passkey_secret(&Self, id: &str) -> Result<(PasskeyInfo, Zeroizing<Vec<u8>>)>;
         fn delete_passkey(&mut Self, ctx: &WriteCtx<'_>, id: &str) -> Result<()>;
+        fn live_identity_keys(&Self) -> Result<Vec<IdentityKeyRecord>>;
+        fn add_identity_key(&mut Self, ctx: &WriteCtx<'_>, private_key: &[u8], public_key: &[u8]) -> Result<String>;
         fn merge_remote(&mut Self, remote: &Snapshot) -> Result<()>;
     }
 

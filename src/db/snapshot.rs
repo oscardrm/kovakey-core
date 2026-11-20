@@ -18,8 +18,8 @@ use super::{db_err, Database};
 use crate::error::{Error, Result};
 use crate::merge::merge;
 use crate::models::{
-    Attachment, BlockKind, Category, CategoryField, HistoryEntry, Item, ItemField, ItemTag,
-    ItemType, NoteBlock, NoteImage, Passkey, Snapshot, Tag, VaultMeta,
+    Attachment, BlockKind, Category, CategoryField, HistoryEntry, IdentityKeyRecord, Item,
+    ItemField, ItemTag, ItemType, NoteBlock, NoteImage, Passkey, Snapshot, Tag, VaultMeta,
 };
 
 fn corrupt(idx: usize, e: Error) -> rusqlite::Error {
@@ -270,6 +270,22 @@ fn read_all(conn: &Connection) -> Result<Snapshot> {
             })
         },
     )?;
+    let identity_keys = query(
+        conn,
+        "SELECT id,private_key,public_key,created_at,updated_at,updated_by,deleted_at
+         FROM identity_keys ORDER BY id",
+        |r| {
+            Ok(IdentityKeyRecord {
+                id: r.get(0)?,
+                private_key: r.get(1)?,
+                public_key: r.get(2)?,
+                created_at: r.get(3)?,
+                updated_at: r.get(4)?,
+                updated_by: r.get(5)?,
+                deleted_at: r.get(6)?,
+            })
+        },
+    )?;
     Ok(Snapshot {
         vault_meta,
         categories,
@@ -282,6 +298,7 @@ fn read_all(conn: &Connection) -> Result<Snapshot> {
         note_images,
         attachments,
         passkeys,
+        identity_keys,
     })
 }
 
@@ -508,6 +525,25 @@ fn write_all(conn: &Connection, snap: &Snapshot) -> Result<()> {
                 p.updated_at,
                 p.updated_by,
                 p.deleted_at
+            ],
+        )
+        .map_err(db_err)?;
+    }
+    for k in &snap.identity_keys {
+        conn.execute(
+            "INSERT INTO identity_keys(id,private_key,public_key,created_at,updated_at,updated_by,deleted_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7)
+             ON CONFLICT(id) DO UPDATE SET private_key=excluded.private_key,public_key=excluded.public_key,
+               updated_at=excluded.updated_at,updated_by=excluded.updated_by,deleted_at=excluded.deleted_at
+             WHERE (excluded.updated_at,excluded.updated_by) >= (identity_keys.updated_at,identity_keys.updated_by)",
+            params![
+                k.id,
+                k.private_key,
+                k.public_key,
+                k.created_at,
+                k.updated_at,
+                k.updated_by,
+                k.deleted_at
             ],
         )
         .map_err(db_err)?;

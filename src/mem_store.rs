@@ -1445,6 +1445,39 @@ impl VaultStore for MemStore {
         })
     }
 
+    fn live_identity_keys(&self) -> Result<Vec<crate::models::IdentityKeyRecord>> {
+        let mut keys: Vec<_> = self
+            .snap
+            .identity_keys
+            .iter()
+            .filter(|k| k.deleted_at.is_none())
+            .cloned()
+            .collect();
+        keys.sort_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)));
+        Ok(keys)
+    }
+
+    fn add_identity_key(
+        &mut self,
+        ctx: &WriteCtx<'_>,
+        private_key: &[u8],
+        public_key: &[u8],
+    ) -> Result<String> {
+        self.tx(ctx, |s| {
+            let id = new_id(ctx)?;
+            s.identity_keys.push(crate::models::IdentityKeyRecord {
+                id: id.clone(),
+                private_key: private_key.to_vec(),
+                public_key: public_key.to_vec(),
+                created_at: ctx.now_ms,
+                updated_at: ctx.now_ms,
+                updated_by: ctx.device_id.to_string(),
+                deleted_at: None,
+            });
+            Ok(id)
+        })
+    }
+
     fn add_passkey(
         &mut self,
         ctx: &WriteCtx<'_>,

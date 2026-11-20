@@ -610,6 +610,45 @@ impl Drop for Passkey {
     }
 }
 
+/// The account's identity key for shared member vaults (see [`crate::member_keys`]). It travels
+/// inside the encrypted personal vault so every device of the person has it, and the Recovery Key
+/// restores it. `private_key` is the 32-byte X25519 secret, blank once tombstoned; it never leaves
+/// the core. The record is immutable except for its tombstone.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct IdentityKeyRecord {
+    /// Record id.
+    pub id: String,
+    /// X25519 private key. Blank once tombstoned.
+    pub private_key: Vec<u8>,
+    /// Matching public key (kept so it can be published without loading the secret).
+    pub public_key: Vec<u8>,
+    /// Creation time, Unix ms UTC.
+    pub created_at: i64,
+    /// Last modification time, Unix ms UTC.
+    pub updated_at: i64,
+    /// Device id of the last writer.
+    pub updated_by: String,
+    /// Tombstone time.
+    pub deleted_at: Option<i64>,
+}
+
+impl fmt::Debug for IdentityKeyRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("IdentityKeyRecord")
+            .field("id", &self.id)
+            .field("private_key", &REDACTED)
+            .field("updated_at", &self.updated_at)
+            .field("deleted_at", &self.deleted_at)
+            .finish()
+    }
+}
+
+impl Drop for IdentityKeyRecord {
+    fn drop(&mut self) {
+        self.private_key.zeroize();
+    }
+}
+
 /// Id of the vault every account starts with (and that pre-vault data belongs to). Fixed so that
 /// devices migrating independently create the *same* record instead of duplicates.
 pub const DEFAULT_VAULT_ID: &str = "default";
@@ -661,4 +700,6 @@ pub struct Snapshot {
     pub attachments: Vec<Attachment>,
     /// Passkeys (ADR 0020).
     pub passkeys: Vec<Passkey>,
+    /// Identity keys for shared member vaults.
+    pub identity_keys: Vec<IdentityKeyRecord>,
 }

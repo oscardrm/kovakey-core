@@ -7,7 +7,10 @@ use crate::models::Snapshot;
 use crate::side_blob::{is_external, sha256_hex};
 
 /// Newest snapshot payload format version this build can read and write.
-pub const SNAPSHOT_FORMAT_VERSION: u8 = 6;
+pub const SNAPSHOT_FORMAT_VERSION: u8 = 7;
+
+/// Version written when the snapshot has passkeys but no identity keys (ADR 0020).
+const PASSKEYS_FORMAT_VERSION: u8 = 6;
 
 /// Version written when the snapshot has attachments but no passkeys (ADR 0019).
 const ATTACHMENTS_FORMAT_VERSION: u8 = 5;
@@ -38,18 +41,20 @@ pub struct ExternalBlob<'a> {
 /// Resolver for externalized image bytes: `(sha256_hex, size) -> bytes`.
 pub type ImageResolver<'a> = dyn FnMut(&str, u64) -> Result<Zeroizing<Vec<u8>>> + 'a;
 
-/// Serialize `snapshot` at v6 if it has passkeys, v5 if it has attachments, else v4 (v2 = the frozen v1 payload followed by
+/// Serialize `snapshot` at v7 if it has identity keys, v6 if it has passkeys, v5 if it has attachments, else v4 (v2 = the frozen v1 payload followed by
 /// the category extension: preset keys and category field templates; v3 appends the Trash
 /// extension: the trash time of each trashed item; v4 appends the Vaults extension: each item's
-/// vault and the tombstone time of deleted vaults; v5 appends attachments; v6 appends passkeys).
+/// vault and the tombstone time of deleted vaults; v5 appends attachments; v6 appends passkeys; v7 appends identity keys).
 /// Writing the lowest version that holds the data keeps vaults readable by older builds.
 ///
 /// Image `sha256`/`size` are verified against the bytes (ADR 0001: never trusted on save);
 /// a mismatch is [`Error::InvalidInput`]. Images above the side-blob threshold are replaced by a
 /// reference and returned in [`EncodedSnapshot::external`].
 pub fn encode_snapshot(snapshot: &Snapshot) -> Result<EncodedSnapshot<'_>> {
-    let version = if !snapshot.passkeys.is_empty() {
+    let version = if !snapshot.identity_keys.is_empty() {
         SNAPSHOT_FORMAT_VERSION
+    } else if !snapshot.passkeys.is_empty() {
+        PASSKEYS_FORMAT_VERSION
     } else if !snapshot.attachments.is_empty() {
         ATTACHMENTS_FORMAT_VERSION
     } else {
@@ -87,6 +92,11 @@ fn encode_at(snapshot: &Snapshot, version: u8) -> Result<EncodedSnapshot<'_>> {
         let tail = postcard::to_allocvec(&ext).map_err(|_| Error::Corrupted)?;
         bytes.extend_from_slice(&tail);
     }
+    if version >= 7 {
+        let ext = v7::Ext::from_snapshot(snapshot)?;
+        let tail = postcard::to_allocvec(&ext).map_err(|_| Error::Corrupted)?;
+        bytes.extend_from_slice(&tail);
+    }
     Ok(EncodedSnapshot {
         version,
         payload: Zeroizing::new(bytes),
@@ -106,7 +116,7 @@ pub fn decode_snapshot(
 ) -> Result<Snapshot> {
     match version {
         1 => v1::decode(bytes, resolve),
-        2..=6 => {
+        2..=7 => {
             let (mut snap, rest) = v1::decode_prefix(bytes, resolve)?;
             let (ext, rest) =
                 postcard::take_from_bytes::<v2::Ext>(rest).map_err(|_| Error::Corrupted)?;
@@ -143,6 +153,14 @@ pub fn decode_snapshot(
             } else {
                 rest
             };
+            let rest = if version >= 7 {
+                let (ids, rest) =
+                    postcard::take_from_bytes::<v7::Ext>(rest).map_err(|_| Error::Corrupted)?;
+                ids.apply(&mut snap)?;
+                rest
+            } else {
+                rest
+            };
             if !rest.is_empty() {
                 return Err(Error::Corrupted);
             }
@@ -158,7 +176,7 @@ pub fn external_image_refs(version: u8, bytes: &[u8]) -> Result<Vec<(String, u64
     match version {
         1 => v1::external_refs(bytes),
         2..=4 => v1::external_refs_prefix(bytes),
-        5 | 6 => {
+        5..=7 => {
             let (mut refs, rest) = v1::external_refs_split(bytes)?;
             let (_, rest) =
                 postcard::take_from_bytes::<v2::Ext>(rest).map_err(|_| Error::Corrupted)?;
@@ -169,8 +187,16 @@ pub fn external_image_refs(version: u8, bytes: &[u8]) -> Result<Vec<(String, u64
             let (att, rest) =
                 postcard::take_from_bytes::<v5::Ext>(rest).map_err(|_| Error::Corrupted)?;
             // Passkeys (v6) are small and always inline: no side blobs to fetch.
-            let rest = if version == 6 {
+            let rest = if version >= 6 {
                 postcard::take_from_bytes::<v6::Ext>(rest)
+                    .map_err(|_| Error::Corrupted)?
+                    .1
+            } else {
+                rest
+            };
+            // Identity keys (v7) are 32-byte keys, also inline.
+            let rest = if version >= 7 {
+                postcard::take_from_bytes::<v7::Ext>(rest)
                     .map_err(|_| Error::Corrupted)?
                     .1
             } else {
@@ -188,7 +214,7 @@ pub fn external_image_refs(version: u8, bytes: &[u8]) -> Result<Vec<(String, u64
 
 /// Whether this build can decode `version`.
 pub fn is_supported_version(version: u8) -> bool {
-    matches!(version, 1..=6)
+    matches!(version, 1..=7)
 }
 
 /// Wire format v1. **Frozen**: postcard is not self-describing, so any change to these types
@@ -1056,6 +1082,86 @@ mod v6 {
     }
 }
 
+/// Wire format v7 extension (appended after v6): identity keys for shared member vaults. Keys are
+/// 32 bytes and travel inline inside the encrypted payload. A live record carries a private key
+/// whose public key matches; a tombstone carries no private key. Written only when the vault has
+/// identity key rows.
+mod v7 {
+    use serde::{Deserialize, Serialize};
+    use zeroize::Zeroize;
+
+    use crate::error::{Error, Result};
+    use crate::member_keys::{IdentityKey, MEMBER_KEY_LEN};
+    use crate::models::{IdentityKeyRecord, Snapshot};
+
+    #[derive(Serialize, Deserialize, Zeroize)]
+    #[zeroize(drop)]
+    pub(super) struct IdentityKeyW {
+        id: String,
+        private_key: Vec<u8>,
+        public_key: Vec<u8>,
+        created_at: i64,
+        updated_at: i64,
+        updated_by: String,
+        deleted_at: Option<i64>,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    pub struct Ext {
+        identity_keys: Vec<IdentityKeyW>,
+    }
+
+    /// Shape checks shared by encode (`InvalidInput`) and decode (`Corrupted`).
+    fn well_formed(id: &str, private_key: &[u8], public_key: &[u8], deleted: bool) -> bool {
+        if id.is_empty() || public_key.len() != MEMBER_KEY_LEN {
+            return false;
+        }
+        if deleted {
+            return private_key.is_empty();
+        }
+        IdentityKey::from_bytes(private_key).is_ok_and(|k| k.public_key().to_bytes() == public_key)
+    }
+
+    impl Ext {
+        pub fn from_snapshot(s: &Snapshot) -> Result<Self> {
+            let mut identity_keys = Vec::with_capacity(s.identity_keys.len());
+            for k in &s.identity_keys {
+                if !well_formed(&k.id, &k.private_key, &k.public_key, k.deleted_at.is_some()) {
+                    return Err(Error::InvalidInput);
+                }
+                identity_keys.push(IdentityKeyW {
+                    id: k.id.clone(),
+                    private_key: k.private_key.clone(),
+                    public_key: k.public_key.clone(),
+                    created_at: k.created_at,
+                    updated_at: k.updated_at,
+                    updated_by: k.updated_by.clone(),
+                    deleted_at: k.deleted_at,
+                });
+            }
+            Ok(Self { identity_keys })
+        }
+
+        pub fn apply(mut self, snap: &mut Snapshot) -> Result<()> {
+            for w in &mut self.identity_keys {
+                if !well_formed(&w.id, &w.private_key, &w.public_key, w.deleted_at.is_some()) {
+                    return Err(Error::Corrupted);
+                }
+                snap.identity_keys.push(IdentityKeyRecord {
+                    id: std::mem::take(&mut w.id),
+                    private_key: std::mem::take(&mut w.private_key),
+                    public_key: std::mem::take(&mut w.public_key),
+                    created_at: w.created_at,
+                    updated_at: w.updated_at,
+                    updated_by: std::mem::take(&mut w.updated_by),
+                    deleted_at: w.deleted_at,
+                });
+            }
+            Ok(())
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod fixtures {
     use std::collections::BTreeSet;
@@ -1239,6 +1345,7 @@ pub(crate) mod fixtures {
             note_images: images,
             attachments: Vec::new(),
             passkeys: Vec::new(),
+            identity_keys: Vec::new(),
         }
     }
 }
@@ -1438,7 +1545,7 @@ mod tests {
     fn unknown_versions_are_rejected_before_parsing() {
         let snap = sample(false);
         let enc = encode_snapshot(&snap).unwrap();
-        for v in [0u8, 7, 255] {
+        for v in [0u8, 8, 255] {
             let r = decode_snapshot(v, &enc.payload, &mut no_resolver());
             assert_eq!(r.err(), Some(Error::UnsupportedVersion), "v{v}");
         }
@@ -1560,11 +1667,11 @@ mod tests {
         if std::env::var("TV_REGEN_GOLDEN").is_err() {
             return;
         }
-        // v1–v5 are frozen; only the newest version's file may be (re)written.
-        let snap = passkey_sample(true);
+        // v1–v6 are frozen; only the newest version's file may be (re)written.
+        let snap = identity_sample(true);
         let enc = encode_snapshot(&snap).unwrap();
-        assert_eq!(enc.version, 6);
-        std::fs::write(GOLDEN_V6, &*enc.payload).unwrap();
+        assert_eq!(enc.version, 7);
+        std::fs::write(GOLDEN_V7, &*enc.payload).unwrap();
     }
 
     fn big_resolver(h: &str, size: u64) -> Result<Zeroizing<Vec<u8>>> {
@@ -1859,6 +1966,118 @@ mod tests {
         let bytes = std::fs::read(GOLDEN_V6).unwrap();
         let out = decode_snapshot(6, &bytes, &mut attach_resolver).unwrap();
         assert_eq!(out, passkey_sample(true));
+    }
+
+    // ---- v7: identity keys for shared member vaults ----
+
+    const GOLDEN_V7: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/snapshot_v7.postcard"
+    );
+
+    /// RFC 9180 test-vector X25519 key pair (published, fake).
+    const FAKE_IDENTITY_SK: &str =
+        "497b4502664cfea5d5af0b39934dac72242a74f8480451e1aee7d6a53320333d";
+    const FAKE_IDENTITY_PK: &str =
+        "430f4b9859665145a6b1ba274024487bd66f03a2dd577d7753c68d7d7d00c00c";
+
+    fn identity(id: &str, deleted_at: Option<i64>) -> crate::models::IdentityKeyRecord {
+        let hex = |h: &str| data_encoding::HEXLOWER.decode(h.as_bytes()).unwrap();
+        crate::models::IdentityKeyRecord {
+            id: id.into(),
+            private_key: if deleted_at.is_some() {
+                Vec::new()
+            } else {
+                hex(FAKE_IDENTITY_SK)
+            },
+            public_key: hex(FAKE_IDENTITY_PK),
+            created_at: 1_700_000_016_000,
+            updated_at: 1_700_000_017_000,
+            updated_by: "dev-a".into(),
+            deleted_at,
+        }
+    }
+
+    /// The v6 sample plus one live identity key and one tombstoned one (what the v7 golden pins).
+    fn identity_sample(big: bool) -> Snapshot {
+        let mut s = passkey_sample(big);
+        s.identity_keys.push(identity("id-1", None));
+        s.identity_keys
+            .push(identity("id-2", Some(1_700_000_018_000)));
+        s
+    }
+
+    #[test]
+    fn identity_keys_bump_to_v7_and_lower_versions_are_kept_otherwise() {
+        assert_eq!(encode_snapshot(&passkey_sample(false)).unwrap().version, 6);
+        assert_eq!(encode_snapshot(&identity_sample(false)).unwrap().version, 7);
+        // Identity keys alone still need v7 (earlier extension lists are just empty).
+        let mut s = vaulted_sample(false);
+        s.identity_keys.push(identity("id-1", None));
+        let enc = encode_snapshot(&s).unwrap();
+        assert_eq!(enc.version, 7);
+        assert!(enc.external.is_empty());
+        assert_eq!(round_trip(&s), s);
+        assert!(external_image_refs(7, &enc.payload).unwrap().is_empty());
+    }
+
+    #[test]
+    fn golden_v7_blob_decodes_to_the_expected_snapshot() {
+        let bytes = std::fs::read(GOLDEN_V7).unwrap();
+        let out = decode_snapshot(7, &bytes, &mut attach_resolver).unwrap();
+        assert_eq!(out, identity_sample(true));
+    }
+
+    #[test]
+    fn current_encoder_still_produces_the_golden_v7_bytes() {
+        let bytes = std::fs::read(GOLDEN_V7).unwrap();
+        let snap = identity_sample(true);
+        let enc = encode_snapshot(&snap).unwrap();
+        assert_eq!(enc.version, 7);
+        assert_eq!(*enc.payload, bytes);
+    }
+
+    #[test]
+    fn malformed_identity_keys_are_rejected_on_encode_and_decode() {
+        let cases: Vec<fn(&mut crate::models::IdentityKeyRecord)> = vec![
+            |k| k.private_key = vec![1; 31],
+            |k| k.public_key = vec![2; 32], // does not match the private key
+            |k| k.public_key.truncate(31),
+            |k| k.private_key.clear(), // live without a key
+            |k| k.id.clear(),
+        ];
+        for (i, mutate) in cases.into_iter().enumerate() {
+            let mut s = identity_sample(false);
+            mutate(&mut s.identity_keys[0]);
+            assert_eq!(
+                encode_snapshot(&s).err(),
+                Some(Error::InvalidInput),
+                "case {i}"
+            );
+        }
+        // A tombstone must have been scrubbed.
+        let mut s = identity_sample(false);
+        s.identity_keys[1].private_key = identity("x", None).private_key.clone();
+        assert_eq!(encode_snapshot(&s).err(), Some(Error::InvalidInput));
+
+        // A damaged public key inside an otherwise valid payload is corrupted on decode.
+        let snap = identity_sample(false);
+        let enc = encode_snapshot(&snap).unwrap();
+        let mut bytes = enc.payload.to_vec();
+        let pk = data_encoding::HEXLOWER
+            .decode(FAKE_IDENTITY_PK.as_bytes())
+            .unwrap();
+        let at = bytes.windows(32).position(|w| w == pk.as_slice()).unwrap();
+        bytes[at] ^= 0x01;
+        assert_eq!(
+            decode_snapshot(7, &bytes, &mut attach_resolver).err(),
+            Some(Error::Corrupted)
+        );
+        // A v6 reader sees trailing bytes: older builds never mis-read a v7 payload.
+        assert_eq!(
+            decode_snapshot(6, &enc.payload, &mut attach_resolver).err(),
+            Some(Error::Corrupted)
+        );
     }
 
     #[test]

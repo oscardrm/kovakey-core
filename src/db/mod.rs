@@ -31,6 +31,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/005_vaults.sql"),
     include_str!("migrations/006_attachments.sql"),
     include_str!("migrations/007_passkeys.sql"),
+    include_str!("migrations/008_identity_keys.sql"),
 ];
 
 /// Latest schema version known to this build.
@@ -186,6 +187,7 @@ mod tests {
             assert_eq!(snap.items.len(), 1);
             assert_eq!(snap.item_fields.len(), 1);
             assert_eq!(snap.item_tags.len(), 1);
+            assert!(snap.identity_keys.is_empty());
             // Pre-vault data lands in the fixed default vault, which exists after migrating.
             assert_eq!(snap.items[0].vault_id, "default");
             assert!(snap

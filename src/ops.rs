@@ -530,6 +530,17 @@ pub trait VaultStore {
     /// Tombstone a passkey and scrub its key.
     fn delete_passkey(&mut self, ctx: &WriteCtx<'_>, id: &str) -> Result<()>;
 
+    /// Live identity keys for shared member vaults, oldest first. **Core-internal**: carries the
+    /// private keys; never expose it through FFI/wasm (see [`crate::session::Session`]).
+    fn live_identity_keys(&self) -> Result<Vec<crate::models::IdentityKeyRecord>>;
+    /// Store a new identity key (validated by the caller) and return its record id.
+    fn add_identity_key(
+        &mut self,
+        ctx: &WriteCtx<'_>,
+        private_key: &[u8],
+        public_key: &[u8],
+    ) -> Result<String>;
+
     /// Create a passkey (ADR 0020): validates the untrusted inputs, generates an ES256 key, stores it
     /// on `item_id` (or on a new Credential item for the site when `None`) and returns the
     /// registration response. The private key never leaves the core.

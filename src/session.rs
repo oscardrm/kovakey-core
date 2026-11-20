@@ -130,6 +130,73 @@ impl<S: VaultStore> Session<S> {
         member_keys::rekey(&self.header, &st.store.snapshot()?, members)
     }
 
+    /// This account's public key for shared member vaults. The identity key is created on first
+    /// use and stored inside this (personal, password) vault, so it syncs to the person's other
+    /// devices and the Recovery Key restores it. The private key never leaves the core. On a
+    /// member vault this is [`Error::InvalidInput`].
+    pub fn member_public_key(&mut self, now_ms: i64) -> Result<MemberPublicKey> {
+        if self.header.is_member() {
+            return Err(Error::InvalidInput);
+        }
+        if let Some(newest) = self.store()?.live_identity_keys()?.last() {
+            return MemberPublicKey::from_bytes(&newest.public_key);
+        }
+        let identity = IdentityKey::generate()?;
+        let public = identity.public_key();
+        let secret = identity.to_bytes();
+        self.write(now_ms, |st, ctx| {
+            st.add_identity_key(ctx, &secret, &public.to_bytes())
+        })?;
+        Ok(public)
+    }
+
+    /// Key ids of every live identity key of this account (another device may have created one
+    /// at the same time, so a member vault may hold wraps for any of them).
+    pub fn member_key_ids(&self) -> Result<Vec<String>> {
+        self.store()?
+            .live_identity_keys()?
+            .iter()
+            .map(|k| MemberPublicKey::from_bytes(&k.public_key).map(|p| p.key_id()))
+            .collect()
+    }
+
+    /// Open a member vault `file` with this account's identity key `key_id` and the `wrap` made
+    /// for it, into a new session built by `make_store`. Only on a personal (password) session;
+    /// an unknown key id is [`Error::NotFound`] and a wrap that does not open is
+    /// [`Error::Decryption`].
+    pub fn open_member_vault<S2: VaultStore>(
+        &self,
+        file: &[u8],
+        key_id: &str,
+        wrap: &[u8],
+        device_id: &str,
+        side_blob: &dyn Fn(&str) -> Option<Vec<u8>>,
+        make_store: impl FnOnce(&VaultKeys) -> Result<S2>,
+    ) -> Result<Session<S2>> {
+        if self.header.is_member() {
+            return Err(Error::InvalidInput);
+        }
+        let record = self
+            .store()?
+            .live_identity_keys()?
+            .into_iter()
+            .find(|k| {
+                MemberPublicKey::from_bytes(&k.public_key).is_ok_and(|p| p.key_id() == key_id)
+            })
+            .ok_or(Error::NotFound)?;
+        let identity = IdentityKey::from_bytes(&record.private_key)?;
+        Session::<S2>::from_vault_file(
+            file,
+            UnlockSecret::MemberWrap {
+                identity: &identity,
+                wrap,
+            },
+            device_id,
+            side_blob,
+            make_store,
+        )
+    }
+
     /// Unlock with the Master Password. Wrong password and tampering are indistinguishable.
     pub fn unlock(
         header: &VaultHeader,
@@ -670,6 +737,92 @@ mod tests {
         assert_eq!(
             p.export_rekeyed(&[alice.public_key()]).unwrap_err(),
             Error::InvalidInput
+        );
+    }
+
+    #[test]
+    fn identity_key_is_created_once_synced_and_opens_member_vaults() {
+        // Alice's personal vault on two devices (A1 on SQLCipher, A2 bootstrapped from A1's file).
+        let (mut a1, _) = new_mem();
+        let pk = a1.member_public_key(10).unwrap();
+        assert_eq!(a1.member_public_key(11).unwrap(), pk, "created only once");
+        assert_eq!(a1.member_key_ids().unwrap(), [pk.key_id()]);
+        let personal = a1.export_vault().unwrap();
+        let a2 = Session::<Database>::from_vault_file(
+            &personal.file,
+            UnlockSecret::Password(PW),
+            "dev-a2",
+            &|n| blobs(&personal).get(n).cloned(),
+            |k| Database::open_in_memory(&k.db_key()?),
+        )
+        .unwrap();
+        assert_eq!(a2.member_key_ids().unwrap(), [pk.key_id()]);
+
+        // A shared member vault wrapped for Alice's key opens on her second device.
+        let mut shared = Session::create_member("dev-x", |_| Ok(MemStore::new())).unwrap();
+        add_login(&mut shared, 20, "Wi-Fi", "fake-wifi");
+        let wrap = shared.wrap_for_member(&pk).unwrap();
+        let sealed = shared.export_vault().unwrap();
+        let sb = blobs(&sealed);
+        let opened = a2
+            .open_member_vault(
+                &sealed.file,
+                &pk.key_id(),
+                &wrap,
+                "dev-a2",
+                &|n| sb.get(n).cloned(),
+                |_| Ok(MemStore::new()),
+            )
+            .unwrap();
+        assert_eq!(opened.store().unwrap().list_items().unwrap().len(), 1);
+
+        // Unknown key id, and member sessions cannot hold identities.
+        assert_eq!(
+            a2.open_member_vault(&sealed.file, "00", &wrap, "d", &|_| None, |_| Ok(
+                MemStore::new()
+            ))
+            .err(),
+            Some(Error::NotFound)
+        );
+        assert_eq!(
+            shared.member_public_key(30).unwrap_err(),
+            Error::InvalidInput
+        );
+        // The private key is never printed.
+        let snap = a1.store().unwrap().snapshot().unwrap();
+        assert!(format!("{:?}", snap.identity_keys).contains("<redacted>"));
+    }
+
+    #[test]
+    fn identity_keys_created_on_two_devices_at_once_are_both_kept_after_merge() {
+        let (mut a, _) = new_mem();
+        let file = a.export_vault().unwrap();
+        let mut b = Session::<MemStore>::from_vault_file(
+            &file.file,
+            UnlockSecret::Password(PW),
+            "dev-b",
+            &|_| None,
+            |_| Ok(MemStore::new()),
+        )
+        .unwrap();
+        let (ka, kb) = (
+            a.member_public_key(10).unwrap(),
+            b.member_public_key(11).unwrap(),
+        );
+        assert_ne!(ka, kb);
+        let (sa, sb) = (a.export_vault().unwrap(), b.export_vault().unwrap());
+        a.merge_remote_vault(&sb.file, &|_| None).unwrap();
+        b.merge_remote_vault(&sa.file, &|_| None).unwrap();
+        let mut ids_a = a.member_key_ids().unwrap();
+        let mut ids_b = b.member_key_ids().unwrap();
+        ids_a.sort();
+        ids_b.sort();
+        assert_eq!(ids_a.len(), 2);
+        assert_eq!(ids_a, ids_b);
+        // Both devices then publish the same (newest) key.
+        assert_eq!(
+            a.member_public_key(20).unwrap(),
+            b.member_public_key(21).unwrap()
         );
     }
 
