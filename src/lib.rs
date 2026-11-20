@@ -18,6 +18,7 @@ pub mod import;
 pub mod kdf;
 pub mod keys;
 pub mod mem_store;
+pub mod member_keys;
 pub mod merge;
 pub mod models;
 pub mod notes;

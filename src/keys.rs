@@ -11,10 +11,19 @@
 //! `.vault`). The host keeps the `DeviceKey` in hardware-protected storage (Keychain/Keystore,
 //! biometric-gated). The data key itself never leaves this crate.
 //!
-//! Header layout (fixed 169 bytes, format version 1):
-//! `magic "TVLT" | version u8 | vault_id[16] | kdf_params[28] | wrapped_by_pw[60] | wrapped_by_rk[60]`.
-//! Each wrap is AES-256-GCM with AAD binding magic, version, vault id, purpose (and KDF params
-//! for the password wrap), so header tampering or downgrade makes unwrapping fail.
+//! Two header kinds share the magic and differ by version byte:
+//!
+//! - **Password header** (format version 1, fixed 169 bytes):
+//!   `magic "TVLT" | 1 | vault_id[16] | kdf_params[28] | wrapped_by_pw[60] | wrapped_by_rk[60]`.
+//!   Each wrap is AES-256-GCM with AAD binding magic, version, vault id, purpose (and KDF params
+//!   for the password wrap), so header tampering or downgrade makes unwrapping fail.
+//! - **Member header** (format version 2, fixed 25 bytes): `magic "TVLT" | 2 | vault_id[16] | epoch u32 BE`.
+//!   The data key is not stored in the header at all: it is wrapped separately for each member's
+//!   public key (see [`crate::member_keys`]). The epoch increases on every re-key. Readers that
+//!   only know version 1 reject it with [`Error::UnsupportedVersion`].
+//!
+//! The whole header is part of the payload AAD (see `vault_file`), so a payload cannot be moved
+//! to another header kind, vault or epoch.
 
 use crate::crypto::{self, SecretKey, KEY_LEN, NONCE_LEN, TAG_LEN};
 use crate::error::{Error, Result};
@@ -22,12 +31,30 @@ use crate::kdf::{KdfParams, PARAMS_LEN};
 use crate::recovery::RecoveryKey;
 
 const MAGIC: &[u8; 4] = b"TVLT";
-/// Current vault header format version.
+/// Format version of the password header.
 pub const FORMAT_VERSION: u8 = 1;
+/// Format version of the member header (data key wrapped per member, no password).
+pub const MEMBER_FORMAT_VERSION: u8 = 2;
 const ID_LEN: usize = 16;
 const WRAPPED_LEN: usize = NONCE_LEN + KEY_LEN + TAG_LEN;
-/// Total serialized header size.
+/// Serialized size of a password header.
 pub const HEADER_LEN: usize = 4 + 1 + ID_LEN + PARAMS_LEN + WRAPPED_LEN * 2;
+/// Serialized size of a member header.
+pub const MEMBER_HEADER_LEN: usize = 4 + 1 + ID_LEN + 4;
+
+/// Size of the header at the start of `bytes`, read from its version byte. Unknown versions are
+/// [`Error::UnsupportedVersion`]; bad magic or too few bytes are [`Error::Corrupted`].
+pub fn header_len(bytes: &[u8]) -> Result<usize> {
+    let magic = bytes.get(..4).ok_or(Error::Corrupted)?;
+    if magic != MAGIC {
+        return Err(Error::Corrupted);
+    }
+    match *bytes.get(4).ok_or(Error::Corrupted)? {
+        FORMAT_VERSION => Ok(HEADER_LEN),
+        MEMBER_FORMAT_VERSION => Ok(MEMBER_HEADER_LEN),
+        _ => Err(Error::UnsupportedVersion),
+    }
+}
 const DB_KEY_LABEL: &[u8] = b"vault/db-key/v1";
 
 /// A random per-device key that unwraps the data key from a device-local wrap blob.
@@ -68,13 +95,27 @@ pub struct DeviceEnrollment {
     pub wrapped: Vec<u8>,
 }
 
+/// The password slots of a version-1 header.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PasswordSlots {
+    kdf: KdfParams,
+    wrapped_by_password: [u8; WRAPPED_LEN],
+    wrapped_by_recovery: [u8; WRAPPED_LEN],
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum HeaderKind {
+    /// Master Password + Recovery Key wrap the data key (format version 1).
+    Password(PasswordSlots),
+    /// The data key is wrapped per member outside the header (format version 2).
+    Members { epoch: u32 },
+}
+
 /// Parsed vault header (contains no plaintext secrets).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VaultHeader {
     vault_id: [u8; ID_LEN],
-    kdf: KdfParams,
-    wrapped_by_password: [u8; WRAPPED_LEN],
-    wrapped_by_recovery: [u8; WRAPPED_LEN],
+    kind: HeaderKind,
 }
 
 /// The unlocked vault data key. Zeroized on drop; dropping it is "locking".
@@ -92,6 +133,10 @@ impl VaultKeys {
     /// Key for encrypting individual payloads/blobs outside the database.
     pub fn data_key(&self) -> &SecretKey {
         &self.data_key
+    }
+
+    pub(crate) fn from_data_key(data_key: SecretKey) -> Self {
+        Self { data_key }
     }
 }
 
@@ -135,31 +180,81 @@ impl VaultHeader {
         let recovery = RecoveryKey::generate()?;
         let kek_pw = kdf.derive_kek(password)?;
         let kek_rk = recovery.derive_kek()?;
-        let header = Self {
-            vault_id: id,
+        let slots = PasswordSlots {
             wrapped_by_password: wrap(&kek_pw, &data_key, &aad(&id, b"pw", &kdf.to_bytes()))?,
             wrapped_by_recovery: wrap(&kek_rk, &data_key, &aad(&id, b"rk", &[]))?,
             kdf,
         };
+        let header = Self {
+            vault_id: id,
+            kind: HeaderKind::Password(slots),
+        };
         Ok((header, VaultKeys { data_key }, recovery))
+    }
+
+    /// Create a brand-new member vault (no password, no Recovery Key): a fresh vault id, epoch 0
+    /// and a random data key. The caller wraps the key for each member with
+    /// [`crate::member_keys::wrap_data_key`].
+    pub fn create_member() -> Result<(Self, VaultKeys)> {
+        let header = Self {
+            vault_id: *uuid::Uuid::now_v7().as_bytes(),
+            kind: HeaderKind::Members { epoch: 0 },
+        };
+        Ok((header, VaultKeys::from_data_key(SecretKey::random()?)))
+    }
+
+    /// Re-key a member vault: same vault id, the next epoch and a fresh random data key. Every
+    /// member needs a new wrap afterwards; wraps of the old epoch no longer open. A password
+    /// vault (or an exhausted epoch counter) is [`Error::InvalidInput`].
+    pub fn rekey_members(&self) -> Result<(Self, VaultKeys)> {
+        let epoch = self.member_epoch()?;
+        let next = epoch.checked_add(1).ok_or(Error::InvalidInput)?;
+        let header = Self {
+            vault_id: self.vault_id,
+            kind: HeaderKind::Members { epoch: next },
+        };
+        Ok((header, VaultKeys::from_data_key(SecretKey::random()?)))
+    }
+
+    /// `true` for a member header (format version 2).
+    pub fn is_member(&self) -> bool {
+        matches!(self.kind, HeaderKind::Members { .. })
+    }
+
+    /// Key epoch of a member header; a password header is [`Error::InvalidInput`].
+    pub fn member_epoch(&self) -> Result<u32> {
+        match self.kind {
+            HeaderKind::Members { epoch } => Ok(epoch),
+            HeaderKind::Password(_) => Err(Error::InvalidInput),
+        }
+    }
+
+    /// The password slots; a member header has none ([`Error::InvalidInput`]).
+    fn slots(&self) -> Result<&PasswordSlots> {
+        match &self.kind {
+            HeaderKind::Password(s) => Ok(s),
+            HeaderKind::Members { .. } => Err(Error::InvalidInput),
+        }
     }
 
     /// Unlock with the Master Password. Wrong password and tampering are indistinguishable.
     pub fn unlock(&self, password: &[u8]) -> Result<VaultKeys> {
-        let kek = self.kdf.derive_kek(password)?;
+        let s = self.slots()?;
+        let kek = s.kdf.derive_kek(password)?;
         unwrap_key(
             &kek,
-            &self.wrapped_by_password,
-            &aad(&self.vault_id, b"pw", &self.kdf.to_bytes()),
+            &s.wrapped_by_password,
+            &aad(&self.vault_id, b"pw", &s.kdf.to_bytes()),
         )
     }
 
     /// Unlock with the Recovery Key.
     pub fn unlock_with_recovery(&self, recovery: &RecoveryKey) -> Result<VaultKeys> {
+        let s = self.slots()?;
         let kek = recovery.derive_kek()?;
         unwrap_key(
             &kek,
-            &self.wrapped_by_recovery,
+            &s.wrapped_by_recovery,
             &aad(&self.vault_id, b"rk", &[]),
         )
     }
@@ -167,7 +262,9 @@ impl VaultHeader {
     /// Enroll this device for quick unlock: generate a [`DeviceKey`] and wrap the data key with it.
     /// The AAD binds magic, format version, vault id and the purpose `"dev"` (not the device id,
     /// so the wrap survives a device-id change). Callers must authenticate the user first.
+    /// Member vaults do not support quick unlock ([`Error::InvalidInput`]).
     pub fn enroll_device(&self, keys: &VaultKeys) -> Result<DeviceEnrollment> {
+        self.slots()?;
         let device_key = DeviceKey::generate()?;
         let wrapped = wrap(
             &device_key.0,
@@ -181,13 +278,13 @@ impl VaultHeader {
     }
 
     /// Unlock with a device key and its wrap blob. Every failure (wrong key, tampering, wrong
-    /// vault, bad length) is the same [`Error::Decryption`].
+    /// vault, bad length, member vault) is the same [`Error::Decryption`].
     pub fn unlock_with_device_key(
         &self,
         device_key: &DeviceKey,
         wrapped: &[u8],
     ) -> Result<VaultKeys> {
-        if wrapped.len() != WRAPPED_LEN {
+        if wrapped.len() != WRAPPED_LEN || self.is_member() {
             return Err(Error::Decryption);
         }
         unwrap_key(&device_key.0, wrapped, &aad(&self.vault_id, b"dev", &[]))
@@ -212,6 +309,7 @@ impl VaultHeader {
         new_password: &[u8],
         kdf: KdfParams,
     ) -> Result<Self> {
+        let s = self.slots()?;
         let kek = kdf.derive_kek(new_password)?;
         let wrapped = wrap(
             &kek,
@@ -219,9 +317,12 @@ impl VaultHeader {
             &aad(&self.vault_id, b"pw", &kdf.to_bytes()),
         )?;
         Ok(Self {
-            kdf,
-            wrapped_by_password: wrapped,
-            ..self.clone()
+            vault_id: self.vault_id,
+            kind: HeaderKind::Password(PasswordSlots {
+                kdf,
+                wrapped_by_password: wrapped,
+                wrapped_by_recovery: s.wrapped_by_recovery,
+            }),
         })
     }
 
@@ -229,13 +330,17 @@ impl VaultHeader {
     /// Recovery Key stops working once the returned header is persisted. The data key and the
     /// password wrap are unchanged, so device wraps and sealed blobs stay valid.
     pub fn rotate_recovery(&self, keys: &VaultKeys) -> Result<(Self, RecoveryKey)> {
+        let s = self.slots()?;
         let recovery = RecoveryKey::generate()?;
         let kek = recovery.derive_kek()?;
         let wrapped = wrap(&kek, &keys.data_key, &aad(&self.vault_id, b"rk", &[]))?;
         Ok((
             Self {
-                wrapped_by_recovery: wrapped,
-                ..self.clone()
+                vault_id: self.vault_id,
+                kind: HeaderKind::Password(PasswordSlots {
+                    wrapped_by_recovery: wrapped,
+                    ..s.clone()
+                }),
             },
             recovery,
         ))
@@ -248,42 +353,55 @@ impl VaultHeader {
 
     /// Serialize to the on-disk header format.
     pub fn to_bytes(&self) -> Vec<u8> {
-        [
-            MAGIC.as_slice(),
-            &[FORMAT_VERSION],
-            &self.vault_id,
-            &self.kdf.to_bytes(),
-            &self.wrapped_by_password,
-            &self.wrapped_by_recovery,
-        ]
-        .concat()
+        match &self.kind {
+            HeaderKind::Password(s) => [
+                MAGIC.as_slice(),
+                &[FORMAT_VERSION],
+                &self.vault_id,
+                &s.kdf.to_bytes(),
+                &s.wrapped_by_password,
+                &s.wrapped_by_recovery,
+            ]
+            .concat(),
+            HeaderKind::Members { epoch } => [
+                MAGIC.as_slice(),
+                &[MEMBER_FORMAT_VERSION],
+                &self.vault_id,
+                &epoch.to_be_bytes(),
+            ]
+            .concat(),
+        }
     }
 
     /// Parse a header. Rejects bad magic, unknown versions (incl. downgrades) and bad lengths.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        if bytes.len() != HEADER_LEN {
+        if bytes.len() != header_len(bytes)? {
             return Err(Error::Corrupted);
         }
-        let (magic, rest) = bytes.split_at(4);
-        if magic != MAGIC {
-            return Err(Error::Corrupted);
+        let rest = bytes.get(5..).ok_or(Error::Corrupted)?;
+        let (id, rest) = rest.split_at_checked(ID_LEN).ok_or(Error::Corrupted)?;
+        let vault_id: [u8; ID_LEN] = id.try_into().map_err(|_| Error::Corrupted)?;
+        if bytes.get(4) == Some(&MEMBER_FORMAT_VERSION) {
+            let epoch: [u8; 4] = rest.try_into().map_err(|_| Error::Corrupted)?;
+            return Ok(Self {
+                vault_id,
+                kind: HeaderKind::Members {
+                    epoch: u32::from_be_bytes(epoch),
+                },
+            });
         }
-        let (ver, rest) = rest.split_at(1);
-        if ver != [FORMAT_VERSION] {
-            return Err(Error::UnsupportedVersion);
-        }
-        let (id, rest) = rest.split_at(ID_LEN);
-        let (kdf, rest) = rest.split_at(PARAMS_LEN);
-        let (wp, wr) = rest.split_at(WRAPPED_LEN);
+        let (kdf, rest) = rest.split_at_checked(PARAMS_LEN).ok_or(Error::Corrupted)?;
+        let (wp, wr) = rest.split_at_checked(WRAPPED_LEN).ok_or(Error::Corrupted)?;
         Ok(Self {
-            vault_id: id.try_into().map_err(|_| Error::Corrupted)?,
-            kdf: KdfParams::from_bytes(kdf)?,
-            wrapped_by_password: wp.try_into().map_err(|_| Error::Corrupted)?,
-            wrapped_by_recovery: wr.try_into().map_err(|_| Error::Corrupted)?,
+            vault_id,
+            kind: HeaderKind::Password(PasswordSlots {
+                kdf: KdfParams::from_bytes(kdf)?,
+                wrapped_by_password: wp.try_into().map_err(|_| Error::Corrupted)?,
+                wrapped_by_recovery: wr.try_into().map_err(|_| Error::Corrupted)?,
+            }),
         })
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -336,7 +454,7 @@ mod tests {
             k.data_key().expose()
         );
         assert!(h2.unlock_with_recovery(&r).is_ok());
-        assert_ne!(h2.kdf, h.kdf);
+        assert_ne!(h2.slots().unwrap().kdf, h.slots().unwrap().kdf);
     }
 
     #[test]
@@ -350,8 +468,14 @@ mod tests {
         );
         assert!(h2.unlock(PW).is_ok());
         assert_eq!(h2.vault_id, h.vault_id);
-        assert_eq!(h2.wrapped_by_password, h.wrapped_by_password);
-        assert_ne!(h2.wrapped_by_recovery, h.wrapped_by_recovery);
+        assert_eq!(
+            h2.slots().unwrap().wrapped_by_password,
+            h.slots().unwrap().wrapped_by_password
+        );
+        assert_ne!(
+            h2.slots().unwrap().wrapped_by_recovery,
+            h.slots().unwrap().wrapped_by_recovery
+        );
         // Survives serialization.
         let parsed = VaultHeader::from_bytes(&h2.to_bytes()).unwrap();
         assert!(parsed.unlock_with_recovery(&new).is_ok());
@@ -443,10 +567,10 @@ mod tests {
     fn password_wrap_cannot_be_replayed_as_a_device_wrap() {
         // Purpose binding: the "pw" wrap under some key must not open as a "dev" wrap.
         let (h, k, _) = new_vault();
-        let kek = h.kdf.derive_kek(PW).unwrap();
+        let kek = h.slots().unwrap().kdf.derive_kek(PW).unwrap();
         let as_device = DeviceKey::from_slice(kek.expose()).unwrap();
         assert!(h
-            .unlock_with_device_key(&as_device, &h.wrapped_by_password)
+            .unlock_with_device_key(&as_device, &h.slots().unwrap().wrapped_by_password)
             .is_err());
         let _ = k;
     }
@@ -534,7 +658,7 @@ mod tests {
             Error::Corrupted
         );
         let mut v = b.clone();
-        v[4] = 2;
+        v[4] = 3;
         assert_eq!(
             VaultHeader::from_bytes(&v).unwrap_err(),
             Error::UnsupportedVersion

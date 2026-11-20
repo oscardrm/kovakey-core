@@ -12,6 +12,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::error::{Error, Result};
 use crate::keys::{DeviceEnrollment, DeviceKey, VaultHeader, VaultKeys};
+use crate::member_keys::{self, IdentityKey, MemberPublicKey};
 use crate::ops::{non_empty, VaultStore, WriteCtx};
 use crate::recovery::RecoveryKey;
 use crate::search::{
@@ -102,6 +103,31 @@ impl<S: VaultStore> Session<S> {
         let (header, keys, recovery) = VaultHeader::create(master_password.as_bytes())?;
         let session = Self::new(device_id, header, keys, false, make_store)?;
         Ok((session, recovery.to_display_string()))
+    }
+
+    /// Create a brand-new member vault: no password and no Recovery Key. Give access with
+    /// [`Session::wrap_for_member`] (starting with the creator's own public key).
+    pub fn create_member(
+        device_id: &str,
+        make_store: impl FnOnce(&VaultKeys) -> Result<S>,
+    ) -> Result<Self> {
+        let (header, keys) = VaultHeader::create_member()?;
+        Self::new(device_id, header, keys, false, make_store)
+    }
+
+    /// Seal this member vault's data key for `member` (see [`crate::member_keys`]). A password
+    /// vault is [`Error::InvalidInput`].
+    pub fn wrap_for_member(&self, member: &MemberPublicKey) -> Result<Vec<u8>> {
+        let st = self.state.as_ref().ok_or(Error::Locked)?;
+        member_keys::wrap_data_key(&self.header, &st.keys, member)
+    }
+
+    /// Re-key this member vault (after removing someone): the current contents sealed under a
+    /// fresh data key and the next epoch, with new wraps for `members` only. The session itself
+    /// keeps the old key; hosts upload the result and reopen from it.
+    pub fn export_rekeyed(&self, members: &[MemberPublicKey]) -> Result<member_keys::Rekeyed> {
+        let st = self.state.as_ref().ok_or(Error::Locked)?;
+        member_keys::rekey(&self.header, &st.store.snapshot()?, members)
     }
 
     /// Unlock with the Master Password. Wrong password and tampering are indistinguishable.
@@ -507,6 +533,10 @@ impl<S: VaultStore> Session<S> {
             UnlockSecret::RecoveryKey(r) => {
                 (header.unlock_with_recovery(&RecoveryKey::parse(r)?)?, true)
             }
+            UnlockSecret::MemberWrap { identity, wrap } => (
+                member_keys::unwrap_data_key(&header, identity, wrap)?,
+                false,
+            ),
         };
         let snapshot = vault_file::open_vault(file, &keys, side_blob)?;
         let mut session = Self::new(device_id, header, keys, via_recovery, make_store)?;
@@ -528,6 +558,13 @@ pub enum UnlockSecret<'a> {
     Password(&'a str),
     /// The Recovery Key (display form).
     RecoveryKey(&'a str),
+    /// A member vault: this person's identity key and the wrap made for its public key.
+    MemberWrap {
+        /// The member's private identity key.
+        identity: &'a IdentityKey,
+        /// The wrap of the vault's data key for that identity's public key.
+        wrap: &'a [u8],
+    },
 }
 
 #[cfg(test)]
@@ -565,6 +602,75 @@ mod tests {
             .iter()
             .map(|b| (b.name.clone(), b.sealed.clone()))
             .collect()
+    }
+
+    #[test]
+    fn member_vault_is_shared_through_wraps_merged_and_rekeyed() {
+        let (alice, bob) = (
+            IdentityKey::generate().unwrap(),
+            IdentityKey::generate().unwrap(),
+        );
+        let mut a = Session::create_member("dev-a", |_| Ok(MemStore::new())).unwrap();
+        assert!(a.header().is_member());
+        add_login(&mut a, 10, "Wi-Fi", "fake-wifi");
+        let wrap_a = a.wrap_for_member(&alice.public_key()).unwrap();
+        let wrap_b = a.wrap_for_member(&bob.public_key()).unwrap();
+        let sealed = a.export_vault().unwrap();
+
+        // Bob opens it with his own key; no password exists.
+        let open = |file: &[u8], who: &IdentityKey, wrap: &[u8], dev: &str, s: &SealedVault| {
+            let b = blobs(s);
+            Session::<MemStore>::from_vault_file(
+                file,
+                UnlockSecret::MemberWrap {
+                    identity: who,
+                    wrap,
+                },
+                dev,
+                &|n| b.get(n).cloned(),
+                |_| Ok(MemStore::new()),
+            )
+        };
+        let mut b = open(&sealed.file, &bob, &wrap_b, "dev-b", &sealed).unwrap();
+        assert_eq!(b.store().unwrap().list_items().unwrap().len(), 1);
+        // Bob's key does not open Alice's wrap; the password paths do not exist.
+        assert_eq!(
+            open(&sealed.file, &bob, &wrap_a, "dev-b", &sealed).err(),
+            Some(Error::Decryption)
+        );
+        assert_eq!(
+            b.change_password("x", "new-fake-pass").unwrap_err(),
+            Error::InvalidInput
+        );
+        assert!(b.enroll_device_unlock("x").is_err());
+
+        // Edits merge both ways.
+        add_login(&mut b, 20, "Bank", "fake-bank");
+        let sb = b.export_vault().unwrap();
+        let bb = blobs(&sb);
+        a.merge_remote_vault(&sb.file, &|n| bb.get(n).cloned())
+            .unwrap();
+        assert_eq!(a.store().unwrap().list_items().unwrap().len(), 2);
+
+        // Removing Bob: re-key for Alice only. Bob's old wrap no longer opens the new file.
+        let r = a.export_rekeyed(&[alice.public_key()]).unwrap();
+        assert_eq!(r.header.member_epoch().unwrap(), 1);
+        let reopened = open(&r.sealed.file, &alice, &r.wraps[0], "dev-a2", &r.sealed).unwrap();
+        assert_eq!(reopened.store().unwrap().list_items().unwrap().len(), 2);
+        assert_eq!(
+            open(&r.sealed.file, &bob, &wrap_b, "dev-b", &r.sealed).err(),
+            Some(Error::Decryption)
+        );
+        // A password vault cannot be wrapped or re-keyed per member.
+        let (p, _) = new_mem();
+        assert_eq!(
+            p.wrap_for_member(&alice.public_key()).unwrap_err(),
+            Error::InvalidInput
+        );
+        assert_eq!(
+            p.export_rekeyed(&[alice.public_key()]).unwrap_err(),
+            Error::InvalidInput
+        );
     }
 
     #[test]

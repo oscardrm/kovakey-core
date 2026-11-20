@@ -2,7 +2,7 @@
 //! File layout:
 //!
 //! ```text
-//! header (HEADER_LEN bytes, see keys.rs) | snapshot_format_version u8 | nonce[12] | ciphertext | tag[16]
+//! header (password or member header, length from its version byte, see keys.rs) | snapshot_format_version u8 | nonce[12] | ciphertext | tag[16]
 //! ```
 //!
 //! The ciphertext is the postcard snapshot sealed with AES-256-GCM under a subkey of the vault
@@ -19,7 +19,7 @@ use zeroize::Zeroizing;
 use crate::codec;
 use crate::crypto;
 use crate::error::{Error, Result};
-use crate::keys::{VaultHeader, VaultKeys, HEADER_LEN};
+use crate::keys::{self, VaultHeader, VaultKeys};
 use crate::models::Snapshot;
 use crate::side_blob::{self, SideBlob};
 
@@ -41,7 +41,9 @@ fn payload_aad(header_bytes: &[u8], version: u8) -> Vec<u8> {
 
 /// Parse the header at the start of a `.vault` file (needed to unlock before opening).
 pub fn read_header(file: &[u8]) -> Result<VaultHeader> {
-    let (header, _) = file.split_at_checked(HEADER_LEN).ok_or(Error::Corrupted)?;
+    let (header, _) = file
+        .split_at_checked(keys::header_len(file)?)
+        .ok_or(Error::Corrupted)?;
     VaultHeader::from_bytes(header)
 }
 
@@ -82,7 +84,9 @@ pub fn seal_vault(
 /// client can download exactly those before [`open_vault`]. Same errors as [`open_vault`]
 /// except that missing blobs are not an error here.
 pub fn required_side_blobs(file: &[u8], keys: &VaultKeys) -> Result<Vec<String>> {
-    let (header_bytes, rest) = file.split_at_checked(HEADER_LEN).ok_or(Error::Corrupted)?;
+    let (header_bytes, rest) = file
+        .split_at_checked(keys::header_len(file)?)
+        .ok_or(Error::Corrupted)?;
     VaultHeader::from_bytes(header_bytes)?;
     let (version, sealed) = rest.split_first().ok_or(Error::Corrupted)?;
     if !codec::is_supported_version(*version) {
@@ -109,7 +113,9 @@ pub fn open_vault(
     keys: &VaultKeys,
     side_blob: &dyn Fn(&str) -> Option<Vec<u8>>,
 ) -> Result<Snapshot> {
-    let (header_bytes, rest) = file.split_at_checked(HEADER_LEN).ok_or(Error::Corrupted)?;
+    let (header_bytes, rest) = file
+        .split_at_checked(keys::header_len(file)?)
+        .ok_or(Error::Corrupted)?;
     let header = VaultHeader::from_bytes(header_bytes)?;
     let (version, sealed) = rest.split_first().ok_or(Error::Corrupted)?;
     if !codec::is_supported_version(*version) {
